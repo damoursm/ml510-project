@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75,<83", "wheel>=0.44,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-lib"
+version = "0.1.0"
+description = "Small, reusable ML teaching capabilities with local ML510 notebooks"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12,<3.14"
+authors = [{name = "Houssem Ben Braiek"}]
+# Course dependencies are maintained in requirements.txt.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ml_lib = ["py.typed"]
