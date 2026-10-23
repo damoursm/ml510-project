@@ -4,7 +4,9 @@ Uses the ticker news endpoint without a ticker filter, so every article is
 included along with the tickers it mentions. Articles are grouped by their UTC
 publish day; each day becomes one parquet file (days without news get none).
 Existing files are skipped, so re-running resumes an interrupted download or
-adds the days since the last run. Reads POLYGON_API_KEY from .env.
+adds the days since the last run. --include-today stores today's articles so
+far; any later run completes the day, since a file written before its UTC day
+ended is fetched again. Reads POLYGON_API_KEY from .env.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,6 +83,22 @@ def day_path(out: Path, day: date) -> Path:
     return out / str(day.year) / f"{day}.parquet"
 
 
+def complete(path: Path, day: date) -> bool:
+    """Whether the day's file exists and was written after the UTC day ended, so it holds all its articles."""
+    return path.exists() and path.stat().st_mtime >= pd.Timestamp(day + timedelta(days=1), tz="UTC").timestamp()
+
+
+def replace(source: Path, target: Path, attempts: int = 10) -> None:
+    """os.replace, retried while a reader such as the recommendations API holds target open on Windows."""
+    for attempt in range(attempts):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5)
+
+
 def download_day(day: date, out: Path) -> int:
     articles = list({a["id"]: a for a in fetch(day)}.values())  # Pages can overlap at the boundary.
     if not articles:
@@ -93,27 +111,29 @@ def download_day(day: date, out: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")  # Parquet readers skip dot-files.
     pq.write_table(table, temporary, compression="zstd")
-    os.replace(temporary, path)
+    replace(temporary, path)
     return len(rows)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", type=date.fromisoformat, default=FIRST_DAY, help="First day, YYYY-MM-DD.")
-    parser.add_argument("--end", type=date.fromisoformat, help="Last day, YYYY-MM-DD; at most yesterday (UTC), the default.")
+    parser.add_argument("--end", type=date.fromisoformat,
+                        help="Last day, YYYY-MM-DD; at most yesterday (UTC), the default, or today with --include-today.")
     parser.add_argument("--out", type=Path, default=ROOT / "data/raw/polygon/news")
     parser.add_argument("--workers", type=int, default=8, help="Parallel requests.")
     parser.add_argument("--overwrite", action="store_true", help="Re-download days that already have a file.")
+    parser.add_argument("--include-today", action="store_true", help="Also store today's (UTC) articles so far.")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
     key = os.environ.get("POLYGON_API_KEY", "").strip()
     if not key:
         raise SystemExit("POLYGON_API_KEY is missing from .env and the environment.")
-    # Today's news is still arriving, and a stored day is never fetched again.
-    yesterday = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)).date()
-    end = min(args.end or yesterday, yesterday)
+    # Today's news is still arriving until the UTC day ends.
+    last = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=0 if args.include_today else 1)).date()
+    end = min(args.end or last, last)
     days = [d.date() for d in pd.date_range(args.start, end)]
-    todo = [d for d in days if args.overwrite or not day_path(args.out, d).exists()]
+    todo = [d for d in days if args.overwrite or not complete(day_path(args.out, d), d)]
     print(f"{len(days)} days from {args.start} to {end}; downloading {len(todo)} into {args.out}", flush=True)
     stored = articles = 0
     started = time.monotonic()

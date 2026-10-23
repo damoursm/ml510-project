@@ -14,5 +14,16 @@ ipykernel==6.30.1
 nbclient==0.10.2
 nbformat==5.10.4
 
+# Market data and news downloads (scripts/download_*.py) and parquet storage.
+requests==2.32.3
+python-dotenv==1.0.1
+pyarrow==23.0.0
+
+# Recommendations API (src/stock_recommender); tzdata gives Windows its time zones, httpx runs the tests.
+fastapi==0.161.1
+uvicorn==0.54.0
+tzdata==2025.3
+httpx==0.28.1
+
 # Install the local course packages in editable mode.
 -e .

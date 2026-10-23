@@ -10,6 +10,7 @@ dist/
 .env
 data/raw/bike_sharing/*
 !data/raw/bike_sharing/README.md
+data/raw/polygon/
 data/processed/*
 !data/processed/README.md
 artifacts/*
