@@ -1,0 +1,35 @@
+old,new,date,link,description
+PEAK,DOC,2024-03-04,2,Healthpeak took the DOC ticker from Physicians Realty: continue holdings only (both filed dividends under DOC)
+RCII,UPBD,2023-02-27,1,Rent-A-Center renamed Upbound
+SWM,MATV,2022-07-06,1,Schweitzer-Mauduit became Mativ after merging with Neenah
+INT,WKC,2023-06-15,1,World Fuel Services renamed World Kinect
+ADS,BFH,2022-04-04,1,Alliance Data Systems renamed Bread Financial
+BCEI,CIVI,2021-11-02,1,Bonanza Creek became Civitas Resources
+SCHN,RDUS,2023-09-01,1,Schnitzer Steel renamed Radius Recycling; RDUS was Radius Health before (no dividends)
+RENN,MTBL,2023-06-22,0,Renren became Moatable: events filed under MTBL before then were Renren's (incl. the 2022-12-22 special)
+FLMN,STR,2022-06-07,0,Falcon Minerals merged into Sitio Royalties: earlier STR events were Falcon's
+BAM,BN,2022-12-12,0,Old Brookfield traded as BAM before taking BN; the new BAM is the spun-off manager
+CR,CXT,2023-04-04,0,Old Crane Holdings traded as CR before taking CXT; the new CR is the spun-off company
+XPER,ADEA,2022-10-03,0,Xperi Holding traded as XPER before taking ADEA; the new XPER is the spun-off company
+RBC,RRX,2021-10-05,0,Regal Beloit traded as RBC before becoming Regal Rexnord (RRX)
+FBHS,FBIN,2022-12-15,0,Fortune Brands traded as FBHS before taking FBIN (with the MasterBrand spin-off the same day)
+HMI,VIRX,2021-02-25,-1,Not a rename: Huami became ZEPP
+CLA,JOAN,2021-03-12,-1,Not a rename: Colonnade Acquisition became Ouster (OUST)
+ETH,BULZ,2021-08-18,-1,Not a rename: an unrelated ETF listing
+MSON,CBL,2021-11-02,-1,Not a rename: Misonix was acquired; CBL relisted after bankruptcy
+MKTY,MDXH,2021-11-04,-1,Not a rename: an unrelated listing
+CPSR,CISO,2022-01-14,-1,Not a rename: an unrelated uplisting
+SEAH,OBE,2022-01-31,-1,Not a rename: Sports Entertainment Acquisition became Super Group (SGHC)
+SVFC,AFRI,2022-06-10,-1,Not a rename: an unrelated listing
+TMST,ULTY,2024-02-29,-1,Not a rename: TimkenSteel became Metallus (MTUS)
+MPLN,CPSR,2025-03-03,-1,Not a rename: MultiPlan became Claritev (CTEV)
+NOVS,SENT,2021-02-03,-1,Not a rename: Novus Capital II became Energy Vault (NRGV)
+DCRN,SOND,2022-01-19,-1,Not a rename: Decarbonization Plus II became Tritium (DCFC)
+FMAC,RPHS,2022-03-31,-1,Not a rename: FirstMark Horizon became Starry (STRY)
+CGRO,PANA,2021-04-07,-1,Not a rename: Collective Growth became Innoviz (INVZ)
+STEM.WS,RIET,2021-09-22,-1,Not a rename: a warrant matched to an ETF
+SBE.WS,FORA,2021-03-03,-1,Not a rename: a warrant matched to another listing
+TTCFW,ACR,2021-02-17,-1,Not a rename: a warrant matched to another listing
+FSR.WS,GENI.WS,2021-04-21,-1,Not a rename: unrelated warrants
+SRNGU,RBOT,2021-09-20,-1,Not a rename: Soaring Eagle units became Ginkgo (DNA)
+FBHS,GEHCV,2022-12-15,-1,Not a rename: a when-issued line of GE HealthCare

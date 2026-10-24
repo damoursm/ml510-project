@@ -1,0 +1,34 @@
+ticker,date,cash,shares_kept,distributed,distributed_ratio,description
+IAC,2021-05-25,0,1,VMEO,1.6235,Vimeo spin-off: 1.6235 VMEO per IAC
+MRK,2021-06-03,0,1,OGN,0.1,Organon spin-off: 1 OGN per 10 MRK
+GRUB,2021-06-15,0,3.355,,0,Just Eat Takeaway all-stock acquisition; its ADSs kept the GRUB ticker
+DTE,2021-07-01,0,1,DTM,0.5,DT Midstream spin-off: 1 DTM per 2 DTE
+IP,2021-10-01,0,1,SLVM,0.0909090909,Sylvamo spin-off: 1 SLVM per 11 IP
+MIC,2021-10-08,37.65,1,,0,Special cash dividend after the Atlantic Aviation sale
+ADS,2021-11-08,0,1,LYLT,0.4,Loyalty Ventures spin-off: 1 LYLT per 2.5 ADS
+EXC,2022-02-02,0,1,CEG,0.3333333333,Constellation Energy spin-off: 1 CEG per 3 EXC
+ZBH,2022-03-01,0,1,ZIMV,0.1,ZimVie spin-off: 1 ZIMV per 10 ZBH
+BDX,2022-04-01,0,1,EMBC,0.2,Embecta spin-off: 1 EMBC per 5 BDX
+T,2022-04-11,0,1,WBD,0.241917,WarnerMedia spin-off: 0.241917 WBD per T
+EHC,2022-07-01,0,1,EHAB,0.5,Enhabit spin-off: 1 EHAB per 2 EHC
+AMC,2022-08-22,0,1,APE,1,AMC Preferred Equity units: 1 APE per AMC
+BHVN,2022-10-04,148.50,0.5,,0,Pfizer acquisition: $148.50 cash and 0.5 new Biohaven per share; the new company kept the ticker
+BAM,2022-12-12,0,0.25,BN,1,Brookfield split: old holders kept BN and got 0.25 of the new manager that took the BAM ticker
+CR,2023-04-04,0,1,CXT,1,Crane separation: old holders kept CXT and got 1 new CR that took the ticker
+MSGE,2023-04-21,0,1,SPHR,1,MSG Entertainment separation: old holders kept SPHR and got 1 new MSGE that took the ticker
+BWA,2023-07-05,0,1,PHIN,0.2,PHINIA spin-off: 1 PHIN per 5 BWA
+ARMK,2023-10-02,0,1,VSTS,0.5,Vestis spin-off: 1 VSTS per 2 ARMK
+DHR,2023-10-02,0,1,VLTO,0.3333333333,Veralto spin-off: 1 VLTO per 3 DHR
+K,2023-10-02,0,1,KLG,0.25,WK Kellogg spin-off: 1 KLG per 4 K
+LAC,2023-10-04,0,1,LAAC,1,Lithium Americas separation: old holders kept LAAC and got 1 new LAC that took the ticker
+WOR,2023-12-01,0,1,WS,1,Worthington Steel spin-off: 1 WS per WOR
+DOC,2024-03-04,0,0.674,,0,Healthpeak acquired Physicians Realty for 0.674 shares and took the DOC ticker
+J,2024-09-30,0,1,AMTM,0.934,Amentum spin-off: 0.934 AMTM per J
+SITC,2024-10-01,0,1,CURB,2,Curbline spin-off: 2 CURB per SITC
+LBTYA,2024-11-13,0,1,SNRE,0.2,Sunrise spin-off: 1 SNRE per 5 LBTYA
+LBTYK,2024-11-13,0,1,SNRE,0.2,Sunrise spin-off: 1 SNRE per 5 LBTYK
+SEM,2024-11-26,0,1,CON,0.8204,Concentra spin-off: 0.8204 CON per SEM
+EQC,2024-12-09,19.00,1,,0,Initial liquidating distribution: $19.00 per share
+WDC,2025-02-24,0,1,SNDK,0.3333333333,Sandisk spin-off: 1 SNDK per 3 WDC
+IAC,2025-04-01,0,1,ANGI,0.5251,Angi spin-off: 0.5251 ANGI per IAC
+SITC,2025-09-02,3.25,1,,0,Special cash dividend (Polygon lists it on 2025-08-15; the price drop shows on 2025-09-02)
