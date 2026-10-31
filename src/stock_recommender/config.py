@@ -23,6 +23,7 @@ class Settings:
     smtp_password: str = field(default="", repr=False)
     email_from: str = ""  # Defaults to smtp_user.
     email_to: str = ""  # Comma-separated recipients.
+    email_daily: bool = True  # Email the top_n lists after each scheduled refresh, once email is configured.
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,5 +37,10 @@ class Settings:
             raw = os.environ.get(f"RECOMMENDER_{setting.name.upper()}")
             if raw is not None:
                 # A relative path is relative to the repository, like .env and the download scripts' outputs.
-                values[setting.name] = ROOT / raw if setting.type is Path else setting.type(raw)
+                if setting.type is Path:
+                    values[setting.name] = ROOT / raw
+                elif setting.type is bool:  # bool("false") would be True.
+                    values[setting.name] = raw.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    values[setting.name] = setting.type(raw)
         return cls(**values)

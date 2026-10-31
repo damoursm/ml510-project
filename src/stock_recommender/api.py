@@ -9,6 +9,7 @@ the same after optionally fetching new data (fetch=true) and before optionally e
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 import threading
 from fastapi import FastAPI, HTTPException, Query
 from . import __version__, notify
@@ -18,6 +19,8 @@ from .models import Models, load_models
 from .recommend import Recommendations, buy_and_sell, recommend
 from .refresh import DailyRefresh
 from .schemas import FetchReport, RecommendationList
+
+log = logging.getLogger("uvicorn.error")
 
 
 class LatestRecommendations:
@@ -72,7 +75,23 @@ class LatestRecommendations:
 def create_app(settings: Settings | None = None, models: Models | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     latest = LatestRecommendations(settings, models or load_models())
-    refresh = DailyRefresh(settings, latest)
+
+    def email_daily(errors: list[str]) -> dict | None:
+        """After a scheduled refresh, email the top_n lists, with any fetch errors, if email is configured."""
+        if not (settings.email_daily and settings.smtp_host and settings.email_to.strip()):
+            return None
+        try:
+            body = latest.lists(settings.top_n)
+        except HTTPException as error:  # No data to recommend from; nothing to send.
+            log.error("Daily email not sent: %s", error.detail)
+            return {"sent_to": [], "error": str(error.detail)}
+        body.fetch = FetchReport(errors=errors)
+        report = notify.send(body, settings)
+        if report.sent_to:
+            log.info("Daily email sent to %s", ", ".join(report.sent_to))
+        return report.model_dump()
+
+    refresh = DailyRefresh(settings, latest, after_scheduled_run=email_daily)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -86,6 +105,7 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
         refresh.stop()
 
     app = FastAPI(title="ML510 stock recommendations", version=__version__, lifespan=lifespan)
+    app.state.refresh = refresh
     limit_query = Query(settings.top_n, ge=1, le=500, description="Stocks in each of the buy and sell lists.")
 
     @app.get("/health")

@@ -52,12 +52,14 @@ class DailyRefresh:
     at settings.refresh_time unless it is "off".
 
     A scheduled run missed while the API was off happens at startup. The API keeps serving the previous
-    recommendations while the scripts rewrite the files.
+    recommendations while the scripts rewrite the files. After each scheduled run, after_scheduled_run(errors)
+    is called, e.g. to email the new recommendations; its return value is stored as last_run["after"].
     """
 
-    def __init__(self, settings: Settings, latest):
+    def __init__(self, settings: Settings, latest, after_scheduled_run=None):
         self.settings = settings
         self.latest = latest
+        self.after_scheduled_run = after_scheduled_run
         self.zone = ZoneInfo(settings.refresh_timezone)
         self.scheduled = settings.refresh_time.lower() not in ("", "off")
         if self.scheduled:
@@ -137,9 +139,19 @@ class DailyRefresh:
 
     def _run_logged(self) -> None:
         try:
-            self.run_once()
+            errors = self.run_once()
         except Exception:  # Keep the schedule alive for the next day.
             log.exception("Refresh failed")
+            errors = ["refresh: see the log"]
+        if self.after_scheduled_run is None:
+            return
+        try:
+            after = self.after_scheduled_run(errors)
+        except Exception:
+            log.exception("After the refresh, failed")
+            after = {"error": "see the log"}
+        if self.last_run is not None:
+            self.last_run["after"] = after
 
     def _loop(self) -> None:
         started = datetime.now(self.zone)

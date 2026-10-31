@@ -2,6 +2,7 @@ from dataclasses import replace
 from email.message import EmailMessage
 from pathlib import Path
 import smtplib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -117,6 +118,41 @@ class EmailTest(unittest.TestCase):
             body = self.post(replace(self.settings, email_to="me@example.com\nBcc: everyone@example.com"), email=True)
         self.assertIn("invalid email settings", body["email"]["error"])
         self.assertEqual(FakeSMTP.sent, [])
+
+    def scheduled_email(self, settings, errors=False):
+        models = replace(load_models(), price=FixedPriceModel({"BIG": 0.02, "DUD": -0.04}))
+        def run(command, **kwargs):  # Each download succeeds, or fails with exit 1 when errors are given.
+            return subprocess.CompletedProcess(command, 1 if errors else 0, "", "no key" if errors else "done")
+
+        with (mock.patch("stock_recommender.refresh.subprocess.run", run),
+              mock.patch("stock_recommender.notify.smtplib.SMTP", FakeSMTP)):
+            app = create_app(replace(settings, top_n=1), models)
+            with TestClient(app):
+                refresh = app.state.refresh
+                refresh._run_logged()  # What the schedule calls at refresh_time.
+        return refresh
+
+    def test_scheduled_refresh_emails_the_lists(self):
+        refresh = self.scheduled_email(self.settings)
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        self.assertIn("BIG", FakeSMTP.sent[0].get_body(("plain",)).get_content())
+        self.assertNotIn("Warning", FakeSMTP.sent[0].get_body(("plain",)).get_content())
+        self.assertEqual(refresh.status()["last_run"]["after"]["sent_to"], ["me@example.com", "team@example.com"])
+
+    def test_scheduled_email_warns_of_a_failed_fetch(self):
+        with self.assertLogs("uvicorn.error", "ERROR"):
+            self.scheduled_email(self.settings, errors=True)
+        self.assertIn("Warning: fetching new data failed", FakeSMTP.sent[0].get_body(("plain",)).get_content())
+
+    def test_scheduled_email_is_skipped_when_off_or_unconfigured(self):
+        for settings in (replace(self.settings, email_daily=False), replace(self.settings, smtp_host="", email_to="")):
+            self.scheduled_email(settings)
+        self.assertEqual(FakeSMTP.sent, [])
+
+    def test_email_daily_reads_false_from_the_environment(self):
+        for raw, expected in (("false", False), ("0", False), ("true", True)):
+            with mock.patch.dict("os.environ", {"RECOMMENDER_EMAIL_DAILY": raw}):
+                self.assertIs(Settings.from_env().email_daily, expected)
 
     def test_password_is_kept_out_of_the_settings_repr(self):
         self.assertNotIn("secret", repr(self.settings))

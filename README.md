@@ -48,7 +48,9 @@ later fetch replaces with their final versions, so the lists for the same `as_of
 Every weekday at 16:00 New York time the API fetches the day's bars and news by itself, and at startup
 if it was not running then. Each fetch re-downloads the last 90 weekdays of bars, because Polygon adjusts
 bars for the splits it knows when they are downloaded; the download scripts also fetch again any day
-stored before it ended. `/health` shows the next and last run. Use a single worker process, or each one
+stored before it ended. Once email is set up (below), each of these runs also emails the top `RECOMMENDER_TOP_N` buys and sells,
+with a warning when the fetch failed and the lists come from older data; `RECOMMENDER_EMAIL_DAILY=false`
+turns that off. `/health` shows the next and last run, and how the last email went. Use a single worker process, or each one
 runs the downloads.
 
 Settings are read from the environment or `.env` as `RECOMMENDER_<NAME>` (see
