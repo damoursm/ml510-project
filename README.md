@@ -66,6 +66,49 @@ RECOMMENDER_EMAIL_TO=you@gmail.com,teammate@example.com
 The API has no authentication: keep it on 127.0.0.1 (uvicorn's default), since anyone who can reach it
 can trigger fetches and emails.
 
+## Backtesting (2021-2025 only)
+
+`src/stock_recommender/backtest` replays the API's own decisions over history to measure the return and
+growth of one model or a combination of models. It uses 2021-2025 data only and never anything from 2026:
+the bounds are constants, only the 2021..2025 folders are listed, every row read is checked against its
+file's day, and models are trained on data cut at their fold's cutoff. The stored `daily_bars` were
+split-adjusted in October 2026, so their 2021-2025 price levels carry 2026 splits; the backtest instead reads
+prices as traded plus the 2021-2025 splits and dividends, downloaded once:
+
+```bash
+python scripts/download_daily_bars.py --unadjusted --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/daily_bars_unadjusted
+python scripts/download_splits.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/splits_2021_2025.parquet
+python scripts/download_dividends.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/dividends_2021_2025.parquet
+python scripts/backtest.py                     # a few minutes; --help lists the options
+```
+
+- **Training and evaluation**: walk-forward. Each test year (2022-2025) is one fold whose models are fit on
+  every earlier year (2021 only trains), and training labels end before the fold's first trade.
+- **Trading**: at a session's close each model ranks the tradable stocks exactly as the API does, on its own
+  bar window; the top 20 (`--top-n`) are bought equal-weight at the next open and sold at the open
+  `horizon_days` later, when the next holding starts. `--side long_short` also shorts the sell list. Costs
+  are 5 bps per side (`--cost-bps`). Returns are total returns: dividends (converted to dollars when paid in
+  another currency) are reinvested at the ex-day open, payouts of 15% of the price or more (specials,
+  liquidations) are held as cash until the holding ends, a split during a holding changes nothing, and a
+  holding across a rename continues in the new ticker. Splits and dividends that Polygon files under a
+  company's later ticker are moved to the ticker that traded them (once, even when Polygon lists them under
+  both). Two curated files fix what the records miss: `configs/corporate_actions_2021_2025.csv` (spin-offs and
+  cash deals, each checked to leave the holder's value continuous) and `configs/ticker_changes_2021_2025.csv`
+  (renames detection misses, false ones it finds, and events filed under another company's ticker). What
+  remains doubtful is in `anomalies.csv`.
+- **No look-ahead**: everything that decides a trade (the model inputs, the universe, the ranking) uses only
+  data up to the decision day's close, and models are trained on a copy of the data cut at their fold's
+  cutoff; only the targets (training labels, realized returns, metrics) look ahead.
+- **Models**: `--models` backtests each model alone; `--ensemble NAME=MODEL:W,MODEL:W` combines models by
+  weighted, rank-normalized scores. The models are still placeholders (`placeholder` scores every stock 0,
+  so it buys the most liquid ones; `random` is a no-skill baseline); a bare run also adds the demo ensemble
+  of the two. To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`) and register
+  a factory in `backtest/registry.py`.
+- **Results** go to `artifacts/<label>/<stamp>/`: growth, total return, CAGR, volatility, Sharpe, drawdown,
+  turnover and information coefficient per strategy, overall and per fold, against an equal-weight universe
+  and SPY, plus the equity curve (`figures/growth.png`), every holding and position, `anomalies.csv`, and
+  `guards.json` (how many files were read, their first and last dates, and the last date of every input).
+
 ## Shared environment and library
 
 When changing reusable library behavior, run:

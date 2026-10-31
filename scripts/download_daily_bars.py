@@ -7,8 +7,8 @@ parquet file; existing files are skipped, so re-running resumes an interrupted
 download or adds the days since the last run. Polygon adjusts for the splits it
 knows at request time, so use --redownload to put recent days back on one basis.
 --include-today stores today's bars so far; any later run fetches them again,
-since a file written before its day ended is not final. Reads POLYGON_API_KEY
-from .env.
+since a file written before its day ended is not final. --unadjusted stores the
+prices as traded instead (use a separate --out). Reads POLYGON_API_KEY from .env.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -103,7 +103,10 @@ def main():
     parser.add_argument("--redownload", type=int, default=0, metavar="DAYS",
                         help="Also re-download the last DAYS weekdays, so they share one split adjustment.")
     parser.add_argument("--include-today", action="store_true", help="Also store today's bars so far.")
+    parser.add_argument("--unadjusted", action="store_true",
+                        help="Store prices and volumes as traded, not split-adjusted; use with a separate --out.")
     args = parser.parse_args()
+    PARAMS["adjusted"] = "false" if args.unadjusted else "true"
     load_dotenv(ROOT / ".env")
     key = os.environ.get("POLYGON_API_KEY", "").strip()
     if not key:
