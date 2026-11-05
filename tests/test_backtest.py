@@ -302,20 +302,27 @@ class ProtocolTest(Store):
 
         result = run_backtest(config(root, test_years=(2024, 2025)), {"flat": lambda: small_models(price=Spy())})
         fits = [entry for entry in log if entry[0] == "fit"]
-        self.assertEqual([str(cutoff.date()) for _, _, cutoff, _ in fits], ["2023-12-29", "2024-12-31"])
-        self.assertEqual(len({model for _, model, _, _ in fits}), 2)  # A new model per fold.
-        for _, model, cutoff, last_label in fits:
+        # One fit per test year on the years before it, then the final fit on everything, for the 2026 test.
+        self.assertEqual([str(cutoff.date()) for _, _, cutoff, _ in fits], ["2023-12-29", "2024-12-31", "2025-02-28"])
+        self.assertEqual(len({model for _, model, _, _ in fits}), 3)  # A new model per fit.
+        for _, model, cutoff, last_label in fits[:2]:
             self.assertLessEqual(last_label, cutoff)
             predictions = [entry[2] for entry in log if entry[0] == "predict" and entry[1] == model]
             self.assertTrue(predictions)
             self.assertGreaterEqual(min(predictions), cutoff)  # Fit first, on the past only.
+            self.assertLess(max(predictions), pd.Timestamp(cutoff.year + 2, 1, 1))  # Then trade one year.
+        final = fits[2][1]
+        self.assertFalse([entry for entry in log if entry[0] == "predict" and entry[1] == final])  # Never scored.
         self.assertEqual(result.guards["training_label_exits"], {2024: "2023-12-29", 2025: "2024-12-31"})
-        # A fold's metrics cover its own holdings, even the last one that exits in the next year.
+        self.assertEqual(result.guards["final_training_label_exit"], fits[2][3].date().isoformat())
+        self.assertFalse(result.guards["final_evaluated"])
+        # A test year's metrics cover its own holdings, which end inside the year.
         scoped = result.metrics.set_index(["strategy", "scope"])
         for fold in result.folds.itertuples():
             row = scoped.loc[("flat", str(fold.fold))]
-            self.assertEqual((row.start, row.end, row.periods), (fold.first_entry, fold.last_exit, fold.holdings))
-        self.assertEqual(result.folds.last_exit.iloc[0].year, 2025)
+            held = result.periods[(result.periods.strategy == "flat") & (result.periods.fold == fold.fold)]
+            self.assertEqual((row.start, row.end, row.periods), (fold.first_entry, fold.last_exit, len(held)))
+            self.assertEqual(fold.last_exit.year, fold.fold)
 
 
 class EngineTest(Store):
@@ -336,9 +343,9 @@ class EngineTest(Store):
                 realized = opens.iloc[t + 1 + holding] / opens.iloc[t + 1] - 1
                 return realized.reindex(tickers)
 
-        result = self.run_backtest({"momentum": lambda: small_models(price=Momentum()),
-                                    "oracle": lambda: small_models(price=Oracle())},
-                                   models=("momentum", "oracle"), top_n=5)
+        result = self.run_backtest({"momentum": lambda: small_models(price=Momentum(), picks=5),
+                                    "oracle": lambda: small_models(price=Oracle(), picks=5)},
+                                   models=("momentum", "oracle"))
         ic = result.signals.groupby("strategy").ic.mean()
         self.assertLess(abs(ic["momentum"]), 0.1)  # Only past bars: no edge on a random walk.
         self.assertGreater(ic["oracle"], 0.95)
@@ -396,13 +403,16 @@ class EngineTest(Store):
         result = self.run_backtest(models=("flat", "random"), factories={
                                        "flat": small_models, "random": lambda: small_models(price=RandomPriceModel(3))},
                                    ensembles=(("mix", (("flat", 1.0), ("random", 2.0))),), null_seeds=3)
-        self.assertEqual(list(result.equity.columns), ["flat", "random", "mix", "universe_ew", "spy"])
+        self.assertEqual(list(result.equity.columns), ["flat", "random", "mix", "account", "universe_ew", "spy"])
         self.assertEqual(set(result.metrics.scope), {"all", "2025"})
-        self.assertEqual(len(result.null), 3)
+        self.assertEqual(len(result.null), 3 * 3)  # Three seeds per model.
         self.assertIn("ensemble(", result.versions["mix"])
         flat = result.positions[result.positions.strategy == "flat"]
         first = flat[flat.decision_date == flat.decision_date.min()]
-        self.assertEqual(len(first), 2)  # top_n=2 with constant scores: the two most liquid tickers.
+        self.assertEqual(len(first), 2)  # picks=2 with constant scores: the two most liquid tickers.
+        self.assertIn("daily_return", result.metrics)
+        self.assertEqual(set(result.scores.candidate), {"flat", "random", "mix"})
+        self.assertEqual(set(result.orders.model), {"flat", "random", "mix"})  # The account trades every list.
 
 
 class ReviewFindingsTest(Store):
@@ -499,10 +509,11 @@ class ReviewFindingsTest(Store):
         costly = self.run_backtest(models=("flat",), cost_bps=10)
         self.assertGreater(costly.periods.cost.sum(), 0)
         self.assertLess(costly.equity.flat.iloc[-1], free.equity.flat.iloc[-1])
-        both = self.run_backtest(models=("flat",), side="long_short", top_n=3)
-        weights = both.positions.weight
-        self.assertEqual((weights > 0).sum(), (weights < 0).sum())
-        self.assertGreater((weights < 0).sum(), 0)
+        self.assertLess(costly.equity.account.iloc[-1], free.equity.account.iloc[-1])
+        self.assertTrue((free.orders.shares % 1 != 0).any())  # Fractional by default.
+        whole = self.run_backtest(models=("flat",), whole_shares=True)
+        filled = whole.orders[whole.orders.shares > 0]
+        self.assertTrue(len(filled) and (filled.shares % 1 == 0).all())
 
     def test_turnover_counts_drift(self):
         store, panel, _ = load_data(config(self.root))
@@ -574,14 +585,14 @@ class ReviewFindingsTest(Store):
         write_bars(root / "bars", opens)
         write_splits(root / "splits.parquet", [])
         (root / "news").mkdir()
-        result = run_backtest(config(root, top_n=6), {"flat": small_models})
+        result = run_backtest(config(root), {"flat": lambda: small_models(picks=6)})
         kinds = result.anomalies.groupby("kind").ticker.apply(set)
         self.assertEqual(kinds["position_return_beyond_2x"], {"CRASH"})
         self.assertEqual(kinds["universe_return_beyond_2x"], {"CRASH"})
         fold = result.folds.iloc[0]
         scoped = result.metrics.set_index(["strategy", "scope"]).loc[("flat", "2025")]
         self.assertEqual((scoped.start, scoped.end), (fold.first_entry, fold.last_exit))
-        self.assertEqual(scoped.periods, fold.holdings)
+        self.assertEqual(scoped.periods, len(result.periods[result.periods.strategy == "flat"]))
 
     def test_cli_backtests_a_model_alone(self):
         spec = importlib.util.spec_from_file_location("backtest_cli", ROOT / "scripts/backtest.py")

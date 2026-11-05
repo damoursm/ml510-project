@@ -68,12 +68,31 @@ RECOMMENDER_EMAIL_TO=you@gmail.com,teammate@example.com
 The API has no authentication: keep it on 127.0.0.1 (uvicorn's default), since anyone who can reach it
 can trigger fetches and emails.
 
+To keep the API running on Windows without starting it by hand, register a scheduled task once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install_task.ps1   # -Uninstall removes it
+```
+
+The task runs `scripts/serve.py`, without a window, when you log on and again at 15:55 New York time on
+weekdays in case the API stopped; it exits at once if an API already listens on port 8000, e.g. one started
+by hand. The API logs to `logs/api.log`. It runs the code checked out in this folder, so restart it after
+pulling or switching branches (`Stop-ScheduledTask` then `Start-ScheduledTask` with
+`-TaskName "ML510 stock recommender"`). It runs only while you are logged on and the computer is awake: one
+asleep at 16:00 fetches and emails when it wakes. `-Python` picks another interpreter than Miniconda's
+`pythonw.exe`.
+
 ## Backtesting (2021-2025 only)
 
 `src/stock_recommender/backtest` replays the API's own decisions over history to measure the return and
-growth of one model or a combination of models. It uses 2021-2025 data only and never anything from 2026:
-the bounds are constants, only the 2021..2025 folders are listed, every row read is checked against its
-file's day, and models are trained on data cut at their fold's cutoff. The stored `daily_bars` were
+growth of each model, and of a $10,000 account that trades every model's recommendations. It uses
+2021-2025 data only and never anything from 2026, which is reserved for the final test:
+- the bounds are constants;
+- only the 2021..2025 folders are listed;
+- every row read is checked against its file's day;
+- models are trained on data cut before the year they trade.
+
+The stored `daily_bars` were
 split-adjusted in October 2026, so their 2021-2025 price levels carry 2026 splits; the backtest instead reads
 prices as traded plus the 2021-2025 splits and dividends, downloaded once:
 
@@ -81,15 +100,39 @@ prices as traded plus the 2021-2025 splits and dividends, downloaded once:
 python scripts/download_daily_bars.py --unadjusted --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/daily_bars_unadjusted
 python scripts/download_splits.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/splits_2021_2025.parquet
 python scripts/download_dividends.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/dividends_2021_2025.parquet
-python scripts/backtest.py                     # a few minutes; --help lists the options
+python scripts/backtest.py                     # about 10 minutes; --help lists the options
 ```
 
-- **Training and evaluation**: walk-forward. Each test year (2022-2025) is one fold whose models are fit on
-  every earlier year (2021 only trains), and training labels end before the fold's first trade.
-- **Trading**: at a session's close each model ranks the tradable stocks exactly as the API does, on its own
-  bar window; the top 20 (`--top-n`) are bought equal-weight at the next open and sold at the open
-  `horizon_days` later, when the next holding starts. `--side long_short` also shorts the sell list. Costs
-  are 5 bps per side (`--cost-bps`). Returns are total returns: dividends (converted to dollars when paid in
+- **Training and tuning: nested walk-forward.** Training data never comes after the year it is scored on.
+  - A *candidate* is a model with one set of hyperparameters (its grid is in `backtest/registry.py`).
+  - Every candidate is fit on all the years before each test year (2022-2025; 2021 only trains), with
+    training labels ending before the year's first trade, and then trades that year.
+  - That run is out of sample, and serves both as the year's test run and as validation for later years.
+  - **Hyperparameters**: for test year T, each model runs its candidate with the best mean annualized log
+    growth (`252·ln(end/start)` per day) over the test years before T. The first test year has no earlier
+    year, so it runs the defaults (each grid's first values).
+  - **Final choice**: the choice made on every test year 2022-2025 is saved for the 2026 test, together with
+    models fit on all of 2021-2025. It is never evaluated here.
+- **Model output**: at a session's close each model ranks the tradable stocks exactly as the API does, on its
+  own bar window. Its recommendations (`score_day(...).trades`) are its best `picks` stocks with their price,
+  the decision-day close.
+- **Per-model trading**: each model buys its list equal-weight at the next open and sells at the open
+  `horizon_days` later, when the next holding starts. Its holdings stay inside each test year. Reported per
+  year: yearly growth, mean daily return (`daily_return`), CAGR, Sharpe, drawdown and IC.
+- **The account**: $10,000 (`--capital`), long only, trading every model's list, each model on its own
+  horizon. Each model's order size is a share of the account's value per recommended stock (`--sizes`).
+  - **Order value**: computed from the account's value at the open of the decision day.
+  - **Shares**: fractional, so each order buys exactly its value at the open. With `--whole-shares` the
+    share count is rounded down from the list price, and a stock priced above its order is skipped.
+  - **Cash**: orders that need more than the account holds are scaled down together. Cash never goes
+    negative, so there is no leverage.
+  - **Costs**: netted per ticker at each open, so a stock sold and bought back at the same open pays only on
+    the difference.
+  - **Dividends**: a lot's dividends are reinvested in the lot rather than paid out as cash.
+  - **Tuning**: for test year T, the sizes are tuned on the test years before T by coordinate ascent
+    (`--sweeps`), maximizing the account's mean annualized log growth. Each model's size moves in turn, and
+    ties keep the smaller size. The first test year splits the account evenly.
+- **Costs and returns**: costs are 5 bps per side (`--cost-bps`). Returns are total returns: dividends (converted to dollars when paid in
   another currency) are reinvested at the ex-day open, payouts of 15% of the price or more (specials,
   liquidations) are held as cash until the holding ends, a split during a holding changes nothing, and a
   holding across a rename continues in the new ticker. Splits and dividends that Polygon files under a
@@ -98,18 +141,32 @@ python scripts/backtest.py                     # a few minutes; --help lists the
   cash deals, each checked to leave the holder's value continuous) and `configs/ticker_changes_2021_2025.csv`
   (renames detection misses, false ones it finds, and events filed under another company's ticker). What
   remains doubtful is in `anomalies.csv`.
-- **No look-ahead**: everything that decides a trade (the model inputs, the universe, the ranking) uses only
-  data up to the decision day's close, and models are trained on a copy of the data cut at their fold's
-  cutoff; only the targets (training labels, realized returns, metrics) look ahead.
-- **Models**: `--models` backtests each model alone; `--ensemble NAME=MODEL:W,MODEL:W` combines models by
-  weighted, rank-normalized scores. The models are still placeholders (`placeholder` scores every stock 0,
-  so it buys the most liquid ones; `random` is a no-skill baseline); a bare run also adds the demo ensemble
-  of the two. To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`) and register
-  a factory in `backtest/registry.py`.
-- **Results** go to `artifacts/<label>/<stamp>/`: growth, total return, CAGR, volatility, Sharpe, drawdown,
-  turnover and information coefficient per strategy, overall and per fold, against an equal-weight universe
-  and SPY, plus the equity curve (`figures/growth.png`), every holding and position, `anomalies.csv`, and
-  `guards.json` (how many files were read, their first and last dates, and the last date of every input).
+- **No look-ahead**:
+  - Everything that decides a trade (the model inputs, the universe, the ranking, the order size) uses only
+    data up to the decision day.
+  - Models are trained on a copy of the data cut before the year they trade.
+  - No choice for a year sees that year or a later one: `select()` raises `LeakageError` otherwise.
+  - Only the targets (training labels, realized returns, metrics) look ahead.
+- **Models**: `--models` lists the models to backtest; `--ensemble NAME=MODEL:W,MODEL:W` adds a model that
+  blends others' rank-normalized scores. The models are still placeholders:
+  - `placeholder` scores every stock 0, so it buys the most liquid ones; its grid tries 20 or 10 picks;
+  - `random` is a no-skill baseline whose grid picks among three seeds, which checks the selection for bias.
+
+  To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`), then register a factory
+  and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also `picks`,
+  `horizon_days` or `bars_lookback`. Candidates that differ only in `picks` share one fit.
+- **Results** go to `artifacts/<label>/<stamp>/`:
+  - `summary.csv` and `yearly.csv`: each model as chosen, the account, the equal-weight universe and SPY.
+  - `metrics.csv`: per test year and chained, the growth, daily return, CAGR, volatility, Sharpe, drawdown,
+    turnover, IC, and the comparison with random lists of the same size.
+  - `scores.csv`: every candidate in every year, which is what the choices read.
+  - `folds.csv`: what was chosen for each test year, on which years, and the account's growth.
+  - `orders.csv`: every account order, with the reason it was filled, scaled or skipped.
+  - `sizes.csv`: every order-size trial.
+  - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test.
+  - Also: the equity curve (`figures/growth.png`), every holding and position, `anomalies.csv`, and
+    `guards.json` (the files read, the last date of every input, the years behind each choice, and
+    `final_evaluated: false`).
 
 ## Shared environment and library
 

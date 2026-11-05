@@ -11,8 +11,8 @@ SESSIONS = pd.bdate_range("2024-11-01", "2025-03-31")  # Weekdays: tests do not 
 
 
 def small_models(**changes):
-    """Placeholder models with short windows, so a few months of synthetic data are enough."""
-    return replace(placeholder_models(), **({"bars_lookback": 3, "horizon_days": 2} | changes))
+    """Placeholder models with short windows and two picks, so a few months of synthetic data are enough."""
+    return replace(placeholder_models(), **({"bars_lookback": 3, "horizon_days": 2, "picks": 2} | changes))
 
 
 def random_walk(tickers: int, sessions: pd.DatetimeIndex = SESSIONS, seed: int = 0) -> dict[str, pd.DataFrame]:
@@ -93,7 +93,8 @@ def write_dividends(path: Path, dividends: list[tuple[str, str, float]], currenc
 
 def config(root: Path, **changes) -> BacktestConfig:
     defaults = dict(models=("flat",), ensembles=(), test_years=(2025,), null_seeds=2, strict_calendar=False,
-                    min_price=0.0, min_dollar_volume=0.0, cost_bps=0.0, top_n=2, bars_dir=root / "bars",
+                    min_price=0.0, min_dollar_volume=0.0, cost_bps=0.0, sizes=(0.0, 0.25, 0.5), sweeps=1,
+                    bars_dir=root / "bars",
                     news_dir=root / "news", splits_path=root / "splits.parquet", dividends_path=None,
                     actions_path=None, changes_path=None)
     return BacktestConfig(**(defaults | changes))

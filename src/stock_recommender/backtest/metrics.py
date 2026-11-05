@@ -18,6 +18,16 @@ def max_drawdown(curve: pd.Series) -> tuple[float, pd.Timestamp | None, pd.Times
     return float(drawdown.min()), peak, trough
 
 
+def log_growth(curve: pd.Series) -> float:
+    """Return the annualized log growth, YEAR * ln(end / start) per open-to-open day: the yearly score the
+    tuning maximizes, comparable across years of different lengths. A wiped-out curve scores -inf."""
+    if len(curve) < 2 or not curve.iloc[0] > 0:
+        return np.nan
+    if not curve.iloc[-1] > 0:
+        return -np.inf
+    return float(YEAR * np.log(curve.iloc[-1] / curve.iloc[0]) / (len(curve) - 1))
+
+
 def performance(curve: pd.Series, periods: pd.DataFrame | None = None) -> dict:
     """Summarize a value curve (and its holding periods): growth, return, risk and trading."""
     if len(curve) < 2:
@@ -32,8 +42,8 @@ def performance(curve: pd.Series, periods: pd.DataFrame | None = None) -> dict:
     result = {
         "start": curve.index[0].date(), "end": curve.index[-1].date(),
         "start_value": float(curve.iloc[0]), "final_value": float(curve.iloc[-1]),
-        "growth": growth, "total_return": growth - 1, "cagr": cagr,
-        "volatility": volatility,
+        "growth": growth, "total_return": growth - 1, "cagr": cagr, "log_growth": log_growth(curve),
+        "daily_return": float(daily.mean()), "volatility": volatility,
         "sharpe": float(daily.mean() / daily.std(ddof=1) * np.sqrt(YEAR)) if volatility and volatility > 0 else np.nan,
         "sortino": float(daily.mean() * YEAR / downside) if downside > 0 else np.nan,
         "max_drawdown": drawdown, "drawdown_peak": peak.date() if peak is not None else None,

@@ -1,8 +1,9 @@
 """The interfaces the recommender's models implement, and placeholders until trained models exist.
 
 To plug in trained models, implement PriceModel and NewsModel (predict, and fit to train in a backtest), bundle
-them in Models, then return them from load_models() to serve them and add a factory to backtest/registry.py
-to backtest them.
+them in Models, then return them from load_models() to serve them, and add a factory and its hyperparameter
+grid to backtest/registry.py to backtest them. A decision's output (recommend.score_day) holds the full
+ranking and `trades`, the model's recommended buys: its best `picks` stocks with their price.
 """
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -125,6 +126,7 @@ class Models:
     horizon_days: int  # Trading days a recommended stock is meant to be held.
     bars_lookback: int  # Trading days of bars the price model reads.
     news_lookback_days: int  # Calendar days of news the news model reads.
+    picks: int = 20  # Most stocks the model recommends buying at each decision: its best scores.
 
     def fit(self, data: TrainingData) -> None:
         """Train each part that has a fit method, once, on the data before a test period."""

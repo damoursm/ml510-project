@@ -22,6 +22,7 @@ class Recommendations:
     news_through: pd.Timestamp | None  # Newest article the models saw, if any.
     universe_size: int  # Tickers that passed the price and liquidity filters.
     table: pd.DataFrame  # One row per scored ticker, best first.
+    trades: pd.DataFrame  # The model's recommended buys: its best `picks` tickers with their price (as_of's close).
 
 
 def news_cutoff(as_of: pd.Timestamp) -> pd.Timestamp:
@@ -72,7 +73,13 @@ def score_day(bars: pd.DataFrame, news: pd.DataFrame, as_of: pd.Timestamp, setti
     table = table.rename_axis("ticker").reset_index().sort_values(
         ["score", "dollar_volume", "ticker"], ascending=[False, False, True], ignore_index=True)
     news_through = snapshot.news.published_utc.max() if len(snapshot.news) else None
-    return Recommendations(as_of, snapshot.news_cutoff, news_through, len(snapshot.universe), table)
+    return Recommendations(as_of, snapshot.news_cutoff, news_through, len(snapshot.universe), table,
+                           trade_list(table, models.picks))
+
+
+def trade_list(table: pd.DataFrame, picks: int) -> pd.DataFrame:
+    """Return a best-first table's first `picks` tickers with their price: what a model recommends buying."""
+    return table.head(picks)[["ticker", "close"]].rename(columns={"close": "price"}).reset_index(drop=True)
 
 
 def recommend(settings: Settings, models: Models) -> Recommendations:

@@ -30,10 +30,13 @@ def normalize_scores(score: pd.Series, method: Normalize) -> pd.Series:
 class Ensemble:
     members: tuple  # (Models or Ensemble, weight) pairs.
     normalize: Normalize = "rank"
+    picks: int | None = None  # Stocks it recommends buying per decision; defaults to its members' largest.
 
     def __post_init__(self):
         if not self.members:
             raise ValueError("An ensemble needs at least one member.")
+        if self.picks is None:
+            object.__setattr__(self, "picks", max(model.picks for model, _ in self.members))
         weights = [weight for _, weight in self.members]
         if min(weights) < 0 or sum(weights) <= 0:
             raise ValueError("Ensemble weights must be non-negative and sum to more than 0.")
