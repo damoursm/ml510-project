@@ -162,6 +162,14 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
   and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also
   `horizon_days` or `bars_lookback`, but not `picks`: a model sets how many stocks it recommends itself, and
   the backtest refuses a grid that tunes it.
+
+  `stock_recommender/features.py` has ten features from the daily bars for a price model such as a random forest:
+  returns over 1, 5 and 20 sessions, momentum over 60 sessions without the last week, the overnight gap, where the
+  day closed in its range, 20-session volatility, the distance below the 60-session high, recent over usual volume,
+  and dollar volume. `decision_features(bars)` computes them in `predict`, and `training_features(data)` in `fit`,
+  next to the labels. Both give the same values for the same day, using no bar after it, and a split changes none
+  of them. They read the 60 sessions models get by default (`LOOKBACK`); `training_features` refuses a model with a
+  shorter `bars_lookback`.
 - **Results** go to `artifacts/<label>/<stamp>/`:
   - `summary.csv` and `yearly.csv`: each model as chosen, the account and the references; the yearly returns
     and their mean.
