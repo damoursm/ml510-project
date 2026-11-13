@@ -84,9 +84,10 @@ asleep at 16:00 fetches and emails when it wakes. `-Python` picks another interp
 
 ## Backtesting (2021-2025 only)
 
-`src/stock_recommender/backtest` replays the API's own decisions over history to measure the return and
-growth of each model, and of a $10,000 account that trades every model's recommendations. It uses
-2021-2025 data only and never anything from 2026, which is reserved for the final test:
+`src/stock_recommender/backtest` replays the API's own decisions over history to measure the yearly return of
+each model, and of the account: the combination model, which starts at $0 and buys every stock every model
+recommends for $1,000. It uses 2021-2025 data only and never anything from 2026, which is reserved for the
+final test:
 - the bounds are constants;
 - only the 2021..2025 folders are listed;
 - every row read is checked against its file's day;
@@ -100,7 +101,7 @@ prices as traded plus the 2021-2025 splits and dividends, downloaded once:
 python scripts/download_daily_bars.py --unadjusted --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/daily_bars_unadjusted
 python scripts/download_splits.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/splits_2021_2025.parquet
 python scripts/download_dividends.py --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/dividends_2021_2025.parquet
-python scripts/backtest.py                     # about 10 minutes; --help lists the options
+python scripts/backtest.py                     # about 2 minutes per model; --help lists the options
 ```
 
 - **Training and tuning: nested walk-forward.** Training data never comes after the year it is scored on.
@@ -108,30 +109,35 @@ python scripts/backtest.py                     # about 10 minutes; --help lists 
   - Every candidate is fit on all the years before each test year (2022-2025; 2021 only trains), with
     training labels ending before the year's first trade, and then trades that year.
   - That run is out of sample, and serves both as the year's test run and as validation for later years.
-  - **Hyperparameters**: for test year T, each model runs its candidate with the best mean annualized log
-    growth (`252·ln(end/start)` per day) over the test years before T. The first test year has no earlier
-    year, so it runs the defaults (each grid's first values).
+  - **Hyperparameters**: for test year T, each model runs its candidate with the best mean yearly return
+    over the test years before T. The first test year has no earlier year, so it runs the defaults (each
+    grid's first values). Nothing that sizes the money is tuned: every order is $1,000, and how many stocks a
+    model recommends (`picks`) is the model's own.
   - **Final choice**: the choice made on every test year 2022-2025 is saved for the 2026 test, together with
     models fit on all of 2021-2025. It is never evaluated here.
 - **Model output**: at a session's close each model ranks the tradable stocks exactly as the API does, on its
   own bar window. Its recommendations (`score_day(...).trades`) are its best `picks` stocks with their price,
   the decision-day close.
-- **Per-model trading**: each model buys its list equal-weight at the next open and sells at the open
-  `horizon_days` later, when the next holding starts. Its holdings stay inside each test year. Reported per
-  year: yearly growth, mean daily return (`daily_return`), CAGR, Sharpe, drawdown and IC.
-- **The account**: $10,000 (`--capital`), long only, trading every model's list, each model on its own
-  horizon. Each model's order size is a share of the account's value per recommended stock (`--sizes`).
-  - **Order value**: computed from the account's value at the open of the decision day.
-  - **Shares**: fractional, so each order buys exactly its value at the open. With `--whole-shares` the
-    share count is rounded down from the list price, and a stock priced above its order is skipped.
-  - **Cash**: orders that need more than the account holds are scaled down together. Cash never goes
-    negative, so there is no leverage.
+- **Trading: $1,000 per recommended stock, from $0.** Each model, and the account that combines them, buys
+  every stock on a list for `--order-value` ($1,000) at the next open and sells it at the open
+  `horizon_days` later, when the next holding starts. Holdings stay inside each test year.
+  - **The account, the combination model**: every backtested model's list, each model on its own horizon.
+    With one model, the account is that model.
+  - **No cash limit, nothing reinvested**: each order is funded with new money, so no order is ever scaled
+    down, and what one trade earns or loses never changes another.
+  - **Return**: a year's profit over its capital, the most the open orders cost at one time ($20,000 for 20
+    picks). A year's mean daily return, volatility, Sharpe and drawdown are measured on that capital too.
+    Over several years, each year counts as funded anew: the yearly returns are averaged, and the profits
+    added up.
+  - **Shares**: fractional, so each order buys exactly $1,000 at the open. With `--whole-shares` the share
+    count is rounded down from the list price, and a stock priced above $1,000 is skipped.
   - **Costs**: netted per ticker at each open, so a stock sold and bought back at the same open pays only on
     the difference.
   - **Dividends**: a lot's dividends are reinvested in the lot rather than paid out as cash.
-  - **Tuning**: for test year T, the sizes are tuned on the test years before T by coordinate ascent
-    (`--sweeps`), maximizing the account's mean annualized log growth. Each model's size moves in turn, and
-    ties keep the smaller size. The first test year splits the account evenly.
+- **References**, with the account's money, fractional shares and the same costs:
+  - `spy_hold`: SPY bought with the account's capital at its first entry and held to its last exit;
+  - `spy_mirror`: SPY bought for every order the account filled, with the same dollars and dates;
+  - `universe_ew`: the same dollars spread equally over the tradable universe of each order's decision day.
 - **Costs and returns**: costs are 5 bps per side (`--cost-bps`). Returns are total returns: dividends (converted to dollars when paid in
   another currency) are reinvested at the ex-day open, payouts of 15% of the price or more (specials,
   liquidations) are held as cash until the holding ends, a split during a holding changes nothing, and a
@@ -142,31 +148,37 @@ python scripts/backtest.py                     # about 10 minutes; --help lists 
   (renames detection misses, false ones it finds, and events filed under another company's ticker). What
   remains doubtful is in `anomalies.csv`.
 - **No look-ahead**:
-  - Everything that decides a trade (the model inputs, the universe, the ranking, the order size) uses only
+  - Everything that decides a trade (the model inputs, the universe, the ranking, the share count) uses only
     data up to the decision day.
   - Models are trained on a copy of the data cut before the year they trade.
   - No choice for a year sees that year or a later one: `select()` raises `LeakageError` otherwise.
   - Only the targets (training labels, realized returns, metrics) look ahead.
-- **Models**: `--models` lists the models to backtest; `--ensemble NAME=MODEL:W,MODEL:W` adds a model that
-  blends others' rank-normalized scores. The models are still placeholders:
-  - `placeholder` scores every stock 0, so it buys the most liquid ones; its grid tries 20 or 10 picks;
-  - `random` is a no-skill baseline whose grid picks among three seeds, which checks the selection for bias.
+- **Models**: `--models` lists the models to backtest, by default every model in `backtest/registry.py`;
+  `--ensemble NAME=MODEL:W,MODEL:W` adds a model that blends others' rank-normalized scores. So far there is
+  one model, `most_liquid`: it expects no move for any stock, so it buys the 20 most liquid ones. It has no
+  hyperparameters, so nothing is tuned for it.
 
   To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`), then register a factory
-  and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also `picks`,
-  `horizon_days` or `bars_lookback`. Candidates that differ only in `picks` share one fit.
+  and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also
+  `horizon_days` or `bars_lookback`, but not `picks`: a model sets how many stocks it recommends itself, and
+  the backtest refuses a grid that tunes it.
 - **Results** go to `artifacts/<label>/<stamp>/`:
-  - `summary.csv` and `yearly.csv`: each model as chosen, the account, the equal-weight universe and SPY.
-  - `metrics.csv`: per test year and chained, the growth, daily return, CAGR, volatility, Sharpe, drawdown,
-    turnover, IC, and the comparison with random lists of the same size.
+  - `summary.csv` and `yearly.csv`: each model as chosen, the account and the references; the yearly returns
+    and their mean.
+  - `metrics.csv`: per test year and over all of them, the capital, profit, return, daily return, volatility,
+    Sharpe, drawdown, turnover, IC, the comparison with each reference, and with random lists of the same
+    size.
   - `scores.csv`: every candidate in every year, which is what the choices read.
-  - `folds.csv`: what was chosen for each test year, on which years, and the account's growth.
-  - `orders.csv`: every account order, with the reason it was filled, scaled or skipped.
-  - `sizes.csv`: every order-size trial.
+  - `folds.csv`: what was chosen for each test year, on which years, and the account's capital, profit and
+    return beside SPY's.
+  - `orders.csv`: every account order, with the reason it was filled or skipped.
+  - `periods.csv` and `positions.csv`: each model as chosen, trading alone; per holding period, what its orders
+    cost, its profit before and after costs, and its turnover (the dollars traded at its entry over the dollars
+    invested); and every order it placed, with its return and how it exited.
+  - `profit.csv` and `figures/profit.png`: each strategy's profit at every open, from $0, test years added up.
   - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test.
-  - Also: the equity curve (`figures/growth.png`), every holding and position, `anomalies.csv`, and
-    `guards.json` (the files read, the last date of every input, the years behind each choice, and
-    `final_evaluated: false`).
+  - Also: `signals.csv`, `null.csv`, `anomalies.csv`, and `guards.json` (the files read, the last date of every
+    input, the years behind each choice, and `final_evaluated: false`).
 
 ## Shared environment and library
 

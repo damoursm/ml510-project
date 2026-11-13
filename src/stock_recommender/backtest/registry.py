@@ -1,30 +1,35 @@
 """The models a backtest can use, by name, and the hyperparameters it tunes for each.
 
+The account (backtest/account.py) is the combination model: it buys every stock that each model registered here
+recommends, for the same order value. To add a model, add its factory to MODELS and its grid to GRIDS; the backtest
+then trades it in the account beside the others.
+
 A factory takes a model's own hyperparameters as keyword arguments and returns new, untrained models, e.g.
 "gbm": lambda depth=3: replace(placeholder_models(), price=GBMPriceModel(depth), version=f"gbm-{depth}").
-A grid may also name a Models field (picks, horizon_days, bars_lookback, news_lookback_days); the backtest sets
-those itself, so the factory never sees them. picks only cuts each decision's ranking, so candidates that differ
-only in picks share one fit.
+A grid may also name a Models field (horizon_days, bars_lookback, news_lookback_days); the backtest sets those
+itself, so the factory never sees them. A grid never names picks: every recommended stock is bought for the order
+value, so how many stocks a model recommends is the model's own, not something the backtest sizes or tunes.
 
 The first value of each hyperparameter is its default: the one used when no earlier year can choose.
 Never register load_models(): once it loads models trained on 2021-2025, a backtest would test on what they saw.
 """
 from dataclasses import fields, replace
 from itertools import product
-from ..models import Models, RandomPriceModel, placeholder_models
+from ..models import Models, placeholder_models
 
 MODEL_FIELDS = frozenset(field.name for field in fields(Models))
 
 
-def random_models(seed: int = 0) -> Models:
-    """Placeholder models whose price model scores at random: a no-skill baseline."""
-    return replace(placeholder_models(), price=RandomPriceModel(seed), version=f"random-{seed}")
+def most_liquid_models() -> Models:
+    """Recommend the most liquid stocks: the price model expects no move for any stock, and equal scores rank the
+    larger dollar volume first (recommend.score_day)."""
+    return replace(placeholder_models(), version="most_liquid")
 
 
-MODELS = {"placeholder": placeholder_models, "random": random_models}
+MODELS = {"most_liquid": most_liquid_models}
 
-# Picking the best of three random seeds must still look like no skill in the next year: a selection-bias check.
-GRIDS = {"placeholder": {"picks": (20, 10)}, "random": {"seed": (0, 1, 2)}}
+GRIDS: dict[str, dict] = {}  # most_liquid has no hyperparameters: it recommends its 20 most liquid stocks.
+UNTUNED = frozenset({"picks"})  # Fields no grid may name.
 
 
 def configurations(grid: dict) -> list[dict]:

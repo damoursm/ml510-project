@@ -13,8 +13,8 @@ from .run import BacktestResult
 # The reference categorical palette, in its fixed order (validated for adjacent lines).
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 SURFACE, INK, INK_SECONDARY, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-SUMMARY_COLUMNS = ["strategy", "final_value", "total_return", "cagr", "daily_return", "volatility", "sharpe",
-                   "max_drawdown", "avg_turnover", "ic_mean", "excess_return_vs_universe_ew", "null_sharpe_percentile"]
+SUMMARY_COLUMNS = ["strategy", "capital", "profit", "mean_yearly_return", "daily_return", "volatility", "sharpe",
+                   "max_drawdown", "avg_turnover", "ic_mean", "excess_return_vs_spy_hold", "null_return_percentile"]
 
 
 def _plain(value):
@@ -38,64 +38,72 @@ def summary_table(result: BacktestResult) -> pd.DataFrame:
 
 
 def yearly_table(result: BacktestResult) -> pd.DataFrame:
-    """Return each strategy's growth in every test year (value at the end over the start)."""
+    """Return each strategy's return in every test year (its profit over its capital), and their mean."""
     years = result.metrics[result.metrics.scope != "all"]
-    table = years.pivot(index="strategy", columns="scope", values="growth")
-    return table.reindex(list(dict.fromkeys(years.strategy))).rename_axis(columns=None).reset_index()
+    order = list(dict.fromkeys(years.strategy))
+    table = years.pivot(index="strategy", columns="scope", values="yearly_return").reindex(order)
+    overall = result.metrics[result.metrics.scope == "all"].set_index("strategy")
+    table["mean"] = overall.mean_yearly_return.reindex(order)
+    return table.rename_axis(columns=None).reset_index()
 
 
 def selection_table(result: BacktestResult) -> pd.DataFrame:
-    """Return the final choice for the 2026 test: each model's hyperparameters and order size."""
+    """Return the final choice for the 2026 test: each model's hyperparameters and order value."""
     return pd.DataFrame([{"model": name, "params": json.dumps(choice["params"]), "picks": choice["picks"],
-                          "horizon_days": choice["horizon_days"], "order_size": choice["order_size"],
-                          "mean_log_growth": choice["mean_log_growth"]}
+                          "horizon_days": choice["horizon_days"], "order_value": choice["order_value"],
+                          "mean_yearly_return": choice["mean_yearly_return"]}
                          for name, choice in result.selection["models"].items()])
+
+
+def _percent(digits: int):
+    return lambda x: f"{x:+.{digits}%}" if pd.notna(x) else ""
 
 
 def format_summary(result: BacktestResult) -> str:
     table = summary_table(result).copy()
-    for column in ("total_return", "cagr", "volatility", "max_drawdown", "excess_return_vs_universe_ew"):
+    for column in ("mean_yearly_return", "volatility", "max_drawdown", "excess_return_vs_spy_hold"):
         if column in table:
-            table[column] = table[column].map(lambda x: f"{x:+.1%}" if pd.notna(x) else "")
+            table[column] = table[column].map(_percent(1))
     if "daily_return" in table:
-        table["daily_return"] = table.daily_return.map(lambda x: f"{x:+.3%}" if pd.notna(x) else "")
-    for column in ("sharpe", "avg_turnover", "ic_mean", "null_sharpe_percentile"):
+        table["daily_return"] = table.daily_return.map(_percent(3))
+    for column in ("sharpe", "avg_turnover", "ic_mean", "null_return_percentile"):
         if column in table:
             table[column] = table[column].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
-    table["final_value"] = table.final_value.map(lambda x: f"{x:,.0f}")
+    table["capital"] = table.capital.map(lambda x: f"{x:,.0f}")
+    table["profit"] = table.profit.map(lambda x: f"{x:+,.0f}" if pd.notna(x) else "")
     years = yearly_table(result)
     for column in years.columns[1:]:
-        years[column] = years[column].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-    return f"{table.to_string(index=False)}\n\nGrowth per test year:\n{years.to_string(index=False)}"
+        years[column] = years[column].map(_percent(1))
+    return (f"{table.to_string(index=False)}\n\nReturn per test year (profit over capital, "
+            f"${result.config.order_value:,.0f} per order):\n{years.to_string(index=False)}")
 
 
-def growth_figure(result: BacktestResult):
-    """Plot each strategy's and benchmark's value at every open, on one log-scaled axis."""
+def profit_figure(result: BacktestResult):
+    """Plot each strategy's and reference's profit at every open, from $0, test years added up."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import FixedLocator, FuncFormatter, MaxNLocator, NullLocator
+    from matplotlib.ticker import FuncFormatter
 
-    columns = list(result.equity.columns)[:len(SERIES)]  # A ninth series would need another hue: leave it out.
+    columns = list(result.profit.columns)[:len(SERIES)]  # A ninth series would need another hue: leave it out.
     figure, axis = plt.subplots(figsize=(10, 5.2), facecolor=SURFACE)
     axis.set_facecolor(SURFACE)
+    axis.axhline(0, color=INK_SECONDARY, linewidth=1)
     for color, column in zip(SERIES, columns):
-        axis.plot(result.equity.index, result.equity[column], color=color, linewidth=2, label=column,
-                  solid_joinstyle="round", solid_capstyle="round")
-    axis.set_yscale("log")
-    values = result.equity[columns].to_numpy()
-    ticks = MaxNLocator(nbins=7, steps=[1, 2, 2.5, 5, 10]).tick_values(np.nanmin(values), np.nanmax(values))
-    axis.yaxis.set_major_locator(FixedLocator([tick for tick in ticks if tick > 0]))
-    axis.yaxis.set_minor_locator(NullLocator())
-    axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+        series = result.profit[column].dropna()
+        axis.plot(series.index, series, color=color, linewidth=2, label=column, solid_joinstyle="round",
+                  solid_capstyle="round")
+    axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:+,.0f}" if value else "0"))
     axis.grid(True, which="major", color=GRID, linewidth=1)
     for side in ("top", "right", "left"):
         axis.spines[side].set_visible(False)
     axis.spines["bottom"].set_color(GRID)
     axis.tick_params(colors=INK_SECONDARY, length=0)
-    axis.set_title(f"Value of {result.config.capital:,.0f} invested, test years chained, out of sample "
-                   f"{result.config.test_years[0]}-{result.config.test_years[-1]}", loc="left", color=INK, fontsize=12)
-    axis.set_ylabel("Value at the open (log scale)", color=INK_SECONDARY)
+    # A bare $ starts matplotlib's math text: escape it.
+    axis.set_title(f"Profit from \\$0 at \\${result.config.order_value:,.0f} per order, test years added up, out of "
+                   f"sample {result.config.test_years[0]}-{result.config.test_years[-1]}", loc="left", color=INK,
+                   fontsize=12)
+    axis.set_ylabel("Profit at the open (\\$)", color=INK_SECONDARY)
     legend = axis.legend(frameon=False, loc="upper left", ncols=min(len(columns), 4))
     for text in legend.get_texts():
         text.set_color(INK)
@@ -119,25 +127,26 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
     run.save_table("yearly", yearly_table(result))
     run.save_table("metrics", result.metrics)
     run.save_table("scores", result.scores)
-    run.save_table("equity", result.equity.rename_axis("date"), index=True)
+    run.save_table("profit", result.profit.rename_axis("date"), index=True)
     run.save_table("folds", result.folds)
     run.save_table("orders", result.orders)
-    run.save_table("sizes", result.sizes)
     run.save_table("periods", result.periods)
     run.save_table("positions", result.positions)
     run.save_table("signals", result.signals)
     run.save_table("null", result.null)
     run.save_table("anomalies", result.anomalies)
-    run.save_figure("growth", growth_figure(result), close=True)
+    run.save_figure("profit", profit_figure(result), close=True)
     run.write_overview(
         "Backtest",
         f"Nested walk-forward backtest on 2021-2025 data only (never 2026), out of sample "
         f"{result.config.test_years[0]}-{result.config.test_years[-1]}: each year's models are trained on the "
-        f"years before it, and its hyperparameters and account order sizes are chosen on the test years before "
-        f"it.\n\n```\n{format_summary(result)}\n```\n\nFinal choice for the 2026 test (selection.json):\n\n"
+        f"years before it, and its hyperparameters are chosen on the test years before it. The account starts at "
+        f"$0 and buys every recommended stock for ${result.config.order_value:,.0f}; a return is the profit over "
+        f"the capital, the most the open orders cost at one time.\n\n```\n{format_summary(result)}\n```\n\n"
+        f"Final choice for the 2026 test (selection.json):\n\n"
         f"```\n{selection_table(result).to_string(index=False)}\n```",
         inspect_first=["tables/summary.csv", "tables/yearly.csv", "selection.json", "tables/folds.csv",
-                       "figures/growth.png", "guards.json", "tables/scores.csv", "tables/metrics.csv"])
+                       "figures/profit.png", "guards.json", "tables/scores.csv", "tables/metrics.csv"])
     return run.directory
 
 

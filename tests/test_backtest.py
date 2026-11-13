@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from stock_recommender.backtest import metrics
+from stock_recommender.backtest.account import HOLDING_COLUMNS, book, holdings, trade
 from stock_recommender.backtest.panel import Panel
-from stock_recommender.backtest.portfolio import simulate
 from stock_recommender.backtest.protocol import FoldData, Period, news_window, schedule, walk_forward
 from stock_recommender.backtest.run import BacktestConfig, load_data, run_backtest
 from stock_recommender.backtest.window import (DataError, LeakageError, WindowedStore, check_window, day_files)
@@ -91,7 +91,7 @@ class WindowGuardTest(Store):
         self.assertTrue(all(date(2021, 1, 1) <= date.fromisoformat(path.stem) <= date(2025, 12, 31) for path in dated))
         self.assertTrue(all(path.parent.name in ("2024", "2025") for path in dated))
         self.assertEqual(sorted(map(str, opened)), sorted(map(str, data[0].opened)))
-        pd.testing.assert_frame_equal(poisoned.equity, clean.equity)
+        pd.testing.assert_frame_equal(poisoned.profit, clean.profit)
         self.assertEqual(poisoned.guards["files_outside_window"], 0)
 
     def test_rows_outside_their_files_day_raise(self):
@@ -226,7 +226,7 @@ class PointInTimeTest(unittest.TestCase):
         self.assertAlmostEqual(returns["B"], 0.05)
         self.assertAlmostEqual(panel.forward_returns(4, 1, ["C"]).forward_return["C"], 0.10)
 
-    def test_a_missing_exit_sells_at_the_last_close_and_a_missing_entry_stays_cash(self):
+    def test_a_missing_exit_sells_at_the_last_close_and_a_missing_entry_is_not_bought(self):
         n = 30
         panel = self.panel({"D": [10.0] * 6 + [np.nan] * (n - 6), "E": [10.0] * n},
                            volumes={"D": [1000.0] * n, "E": [1000.0] * 4 + [0.0] + [1000.0] * (n - 5)})
@@ -349,8 +349,9 @@ class EngineTest(Store):
         ic = result.signals.groupby("strategy").ic.mean()
         self.assertLess(abs(ic["momentum"]), 0.1)  # Only past bars: no edge on a random walk.
         self.assertGreater(ic["oracle"], 0.95)
-        growth = result.metrics.set_index(["strategy", "scope"]).growth
-        self.assertGreater(growth["oracle", "all"], growth["universe_ew", "all"] * 1.5)
+        returns = result.metrics.set_index(["strategy", "scope"]).mean_yearly_return
+        self.assertGreater(returns["oracle", "all"], returns["universe_ew", "all"] + 0.5)
+        self.assertGreater(returns["oracle", "all"], returns["momentum", "all"] + 0.5)
 
     def test_the_backtest_ranks_exactly_as_the_api(self):
         store, panel, news = load_data(config(self.root))
@@ -368,48 +369,47 @@ class EngineTest(Store):
         pd.testing.assert_frame_equal(backtest.table, api.table)
         self.assertEqual((backtest.as_of, backtest.universe_size), (api.as_of, api.universe_size))
 
-    def test_growth_formulas(self):
+    def test_ledger_formulas(self):
         store, panel, _ = load_data(config(self.root))
         opens = self.prices["open"]
         periods = [Period(10, 2), Period(12, 2)]
-        weights = [pd.Series({"T000": 1.0}), pd.Series({"T001": 1.0})]
-        curve, table, positions = simulate(panel, periods, weights, cost_bps=10, borrow_bps=0, capital=1000,
-                                           folds=[2025, 2025])
+        lists = [pd.DataFrame({"ticker": [ticker], "price": [50.0]}) for ticker in ("T000", "T001")]
+        ledger = trade(panel.sessions, [book(panel, "m", periods, lists, 1000.0)], cost_bps=10, record=True)
         a = opens["T000"].iloc[13] / opens["T000"].iloc[11]
         b = opens["T001"].iloc[15] / opens["T001"].iloc[13]
-        expected = 1000 * (1 - 0.001)  # Buy T000 (turnover 1).
-        expected *= a
-        expected *= 1 - 0.001 * 2  # Sell T000, buy T001 (turnover 2).
-        expected *= b
-        expected *= 1 - 0.001  # Sell T001 at the end.
-        self.assertAlmostEqual(curve.iloc[-1], expected)
-        self.assertEqual(curve.index[0], panel.sessions[11])
-        self.assertEqual(curve.index[-1], panel.sessions[15])
-        self.assertEqual(list(table.turnover), [1.0, 2.0])
-        mid = 999 * opens["T000"].iloc[12] / opens["T000"].iloc[11]
-        self.assertAlmostEqual(curve[panel.sessions[12]], mid)
-
-    def test_long_short_nets_out_and_pays_borrow(self):
-        store, panel, _ = load_data(config(self.root))
-        weights = [pd.Series({"T000": 0.5, "T001": -0.5})]
-        curve, table, _ = simulate(panel, [Period(10, 2)], weights, cost_bps=0, borrow_bps=252, capital=100,
-                                   folds=[2025])
-        opens = self.prices["open"]
-        a = opens["T000"].iloc[13] / opens["T000"].iloc[11] - 1
-        b = opens["T001"].iloc[13] / opens["T001"].iloc[11] - 1
-        self.assertAlmostEqual(curve.iloc[-1], 100 * (1 + 0.5 * a - 0.5 * b - 0.5 * 1e-4 * 2))
+        # Buy T000; sell it and buy T001 at the same open; sell T001 at the end: 10 bps of each.
+        fees = [0.001 * 1000, 0.001 * (1000 * a + 1000), 0.001 * 1000 * b]
+        self.assertAlmostEqual(ledger.profit.iloc[-1], 1000 * (a - 1) + 1000 * (b - 1) - sum(fees))
+        self.assertEqual(ledger.profit.index[0], panel.sessions[11])
+        self.assertEqual(ledger.profit.index[-1], panel.sessions[15])
+        mid = 1000 * (opens["T000"].iloc[12] / opens["T000"].iloc[11] - 1) - fees[0]
+        self.assertAlmostEqual(ledger.profit[panel.sessions[12]], mid)
+        table = holdings(ledger, periods, panel.sessions)
+        self.assertEqual(list(table.columns), HOLDING_COLUMNS)
+        np.testing.assert_allclose(table.turnover, [1.0, a + 1])  # Bought all; then sold all and bought all.
+        np.testing.assert_allclose(table.fees, [fees[0], fees[1] + fees[2]])  # The last exit's go to the last.
+        np.testing.assert_allclose(table.gross_profit, [1000 * (a - 1), 1000 * (b - 1)])
+        self.assertAlmostEqual(table.net_profit.sum(), ledger.profit.iloc[-1])
+        self.assertEqual(list(table.invested), [1000.0, 1000.0])
 
     def test_a_run_reports_every_strategy_and_benchmark(self):
         result = self.run_backtest(models=("flat", "random"), factories={
                                        "flat": small_models, "random": lambda: small_models(price=RandomPriceModel(3))},
                                    ensembles=(("mix", (("flat", 1.0), ("random", 2.0))),), null_seeds=3)
-        self.assertEqual(list(result.equity.columns), ["flat", "random", "mix", "account", "universe_ew", "spy"])
+        self.assertEqual(list(result.profit.columns),
+                         ["flat", "random", "mix", "account", "spy_hold", "spy_mirror", "universe_ew"])
         self.assertEqual(set(result.metrics.scope), {"all", "2025"})
         self.assertEqual(len(result.null), 3 * 3)  # Three seeds per model.
         self.assertIn("ensemble(", result.versions["mix"])
         flat = result.positions[result.positions.strategy == "flat"]
         first = flat[flat.decision_date == flat.decision_date.min()]
         self.assertEqual(len(first), 2)  # picks=2 with constant scores: the two most liquid tickers.
+        filled = flat[flat.reason == "filled"]
+        np.testing.assert_allclose(filled.forward_return, filled.exit_value / filled.cost - 1)
+        self.assertTrue(set(filled.exit_reason) <= {"open", "renamed", "last_close"})
+        held = result.periods[result.periods.strategy == "flat"]
+        self.assertTrue(set(HOLDING_COLUMNS) <= set(held.columns))
+        self.assertAlmostEqual(held.net_profit.sum(), result.profit.flat.iloc[-1])  # Every cost is a holding's.
         self.assertIn("daily_return", result.metrics)
         self.assertEqual(set(result.scores.candidate), {"flat", "random", "mix"})
         self.assertEqual(set(result.orders.model), {"flat", "random", "mix"})  # The account trades every list.
@@ -454,7 +454,7 @@ class ReviewFindingsTest(Store):
         self.assertEqual(set(seen), {3})
         beside = self.run_backtest({"short": short, "long": long}, models=("short", "long"))
         self.assertEqual(set(seen), {3})
-        pd.testing.assert_series_equal(alone.equity["short"], beside.equity["short"])
+        pd.testing.assert_series_equal(alone.profit["short"], beside.profit["short"])
 
     def test_decisions_and_training_never_see_a_later_split(self):
         split = SESSIONS.get_loc(pd.Timestamp("2025-02-03"))
@@ -504,26 +504,30 @@ class ReviewFindingsTest(Store):
                                        ensembles=(("mix", ((heavy, 3.0), (light, 1.0))),))
             pd.testing.assert_series_equal(picks(result, "mix"), picks(result, heavy), check_names=False)
 
-    def test_trading_options_reach_the_simulation(self):
+    def test_trading_options_reach_the_trades(self):
         free = self.run_backtest(models=("flat",))
         costly = self.run_backtest(models=("flat",), cost_bps=10)
-        self.assertGreater(costly.periods.cost.sum(), 0)
-        self.assertLess(costly.equity.flat.iloc[-1], free.equity.flat.iloc[-1])
-        self.assertLess(costly.equity.account.iloc[-1], free.equity.account.iloc[-1])
+        self.assertGreater(costly.periods.fees.sum(), 0)
+        held = costly.periods[costly.periods.strategy == "flat"]
+        self.assertAlmostEqual(held.net_profit.sum(), costly.profit.flat.iloc[-1])  # Every cost is a holding's.
+        self.assertLess(costly.profit.flat.iloc[-1], free.profit.flat.iloc[-1])
+        self.assertLess(costly.profit.account.iloc[-1], free.profit.account.iloc[-1])
         self.assertTrue((free.orders.shares % 1 != 0).any())  # Fractional by default.
         whole = self.run_backtest(models=("flat",), whole_shares=True)
         filled = whole.orders[whole.orders.shares > 0]
         self.assertTrue(len(filled) and (filled.shares % 1 == 0).all())
 
-    def test_turnover_counts_drift(self):
+    def test_turnover_counts_only_what_changes_hands(self):
         store, panel, _ = load_data(config(self.root))
         opens = self.prices["open"]
-        weights = [pd.Series({"T000": 0.5, "T001": 0.5})] * 2
-        _, table, _ = simulate(panel, [Period(10, 2), Period(12, 2)], weights, 0, 0, 1000, [2025, 2025])
+        both = pd.DataFrame({"ticker": ["T000", "T001"], "price": [50.0, 50.0]})
+        periods = [Period(10, 2), Period(12, 2)]
+        ledger = trade(panel.sessions, [book(panel, "m", periods, [both, both], 1000.0)], 0.0, record=True)
         a = opens["T000"].iloc[13] / opens["T000"].iloc[11]
         b = opens["T001"].iloc[13] / opens["T001"].iloc[11]
-        drift = 0.5 * a / (0.5 * a + 0.5 * b)
-        self.assertAlmostEqual(table.turnover.iloc[1], 2 * abs(drift - 0.5))
+        # Each stock is sold at its value and bought back for $1,000 at the same open: only the difference trades.
+        self.assertAlmostEqual(holdings(ledger, periods, panel.sessions).turnover.iloc[1],
+                               (abs(1000 * a - 1000) + abs(1000 * b - 1000)) / 2000)
 
     def test_dividends_are_income_not_losses(self):
         root = self.root / "dividends"
@@ -598,7 +602,7 @@ class ReviewFindingsTest(Store):
         spec = importlib.util.spec_from_file_location("backtest_cli", ROOT / "scripts/backtest.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for argv, ensembles in ((["--models", "placeholder"], ()), ([], BacktestConfig().ensembles)):
+        for argv, ensembles in ((["--models", "most_liquid"], ()), ([], BacktestConfig().ensembles)):
             with (mock.patch.object(sys, "argv", ["backtest.py", *argv]),
                   mock.patch.object(module, "run_backtest", side_effect=ValueError("stop")) as run,
                   redirect_stderr(io.StringIO())):
@@ -851,21 +855,21 @@ class IsolationTest(Store):
             self.assertTrue(all(cell.base is None for cell in cells if isinstance(cell, np.ndarray)))
 
     def test_strategy_names_must_be_unique_and_not_benchmarks(self):
-        for changes in ({"ensembles": (("spy", (("flat", 1.0),)),)}, {"ensembles": (("flat", (("flat", 1.0),)),)}):
+        for changes in ({"ensembles": (("spy_hold", (("flat", 1.0),)),)},
+                        {"ensembles": (("flat", (("flat", 1.0),)),)}):
             with self.assertRaises(ValueError):
                 config(self.root, **changes)
 
 
 class MetricsTest(unittest.TestCase):
-    def test_known_curve(self):
+    def test_known_path(self):
         days = pd.bdate_range("2025-01-01", periods=4)
-        curve = pd.Series([100.0, 110.0, 99.0, 120.0], index=days)
-        drawdown, peak, trough = metrics.max_drawdown(curve)
-        self.assertAlmostEqual(drawdown, -0.1)
-        self.assertEqual((peak, trough), (days[1], days[2]))
-        summary = metrics.performance(curve)
-        self.assertAlmostEqual(summary["growth"], 1.2)
-        self.assertAlmostEqual(summary["cagr"], 1.2 ** (252 / 3) - 1)
+        path = pd.Series([0.0, 0.1, -0.01, 0.2], index=days)  # Profit over capital at each open.
+        summary = metrics.ledger_performance(path)
+        self.assertAlmostEqual(summary["daily_return"], 0.2 / 3)
+        self.assertAlmostEqual(summary["max_drawdown"], -0.11)  # In points of capital, from the best point.
+        self.assertEqual((summary["drawdown_peak"], summary["drawdown_trough"]), (days[1].date(), days[2].date()))
+        self.assertEqual(metrics.ledger_performance(path[:1]), {})
 
     def test_information_coefficient(self):
         tickers = [f"T{i}" for i in range(30)]

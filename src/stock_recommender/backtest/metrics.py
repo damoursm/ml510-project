@@ -1,6 +1,8 @@
-"""Return, growth, risk and signal metrics of a simulated portfolio.
+"""Return, risk and signal metrics of an account's ledger (backtest/account.py).
 
-Return and risk come from the value at every open (open-to-open daily returns, 252 a year, risk-free rate 0).
+An account funds each order anew and reinvests nothing, so it is measured on its capital: its cumulative return
+is its profit so far over that capital, and its daily return is the day's change in it (open to open, 252 a year,
+risk-free rate 0).
 """
 import numpy as np
 import pandas as pd
@@ -8,67 +10,48 @@ import pandas as pd
 YEAR = 252
 
 
-def max_drawdown(curve: pd.Series) -> tuple[float, pd.Timestamp | None, pd.Timestamp | None]:
-    """Return the deepest fall from a running peak, with the peak's and the trough's dates."""
-    if len(curve) < 2:
-        return 0.0, None, None
-    drawdown = curve / curve.cummax() - 1
-    trough = drawdown.idxmin()
-    peak = curve.loc[:trough].idxmax()
-    return float(drawdown.min()), peak, trough
+def period_summary(periods: pd.DataFrame | None) -> dict:
+    """Summarize a model's holding periods (account.holdings): their count, the share with a profit after costs,
+    the turnover, the costs paid and the orders filled per holding."""
+    if periods is None or not len(periods):
+        return {}
+    return {"periods": len(periods), "period_hit_rate": float((periods.net_profit > 0).mean()),
+            "avg_turnover": float(periods.turnover.mean()), "total_fees": float(periods.fees.sum()),
+            "avg_positions": float(periods.filled.mean())}
 
 
-def log_growth(curve: pd.Series) -> float:
-    """Return the annualized log growth, YEAR * ln(end / start) per open-to-open day: the yearly score the
-    tuning maximizes, comparable across years of different lengths. A wiped-out curve scores -inf."""
-    if len(curve) < 2 or not curve.iloc[0] > 0:
-        return np.nan
-    if not curve.iloc[-1] > 0:
-        return -np.inf
-    return float(YEAR * np.log(curve.iloc[-1] / curve.iloc[0]) / (len(curve) - 1))
-
-
-def performance(curve: pd.Series, periods: pd.DataFrame | None = None) -> dict:
-    """Summarize a value curve (and its holding periods): growth, return, risk and trading."""
-    if len(curve) < 2:
-        return {"growth": np.nan}
-    daily = curve.pct_change().dropna()
-    growth = float(curve.iloc[-1] / curve.iloc[0])
-    years = len(daily) / YEAR
+def ledger_performance(path: pd.Series, periods: pd.DataFrame | None = None) -> dict:
+    """Summarize an account's cumulative return on its capital at every open: the mean daily return, risk, and
+    the deepest drawdown, in points of capital (-0.1 is a fall of a tenth of the capital from the best point)."""
+    if len(path) < 2:
+        return period_summary(periods)
+    daily = path.diff().dropna()
     volatility = float(daily.std(ddof=1) * np.sqrt(YEAR)) if len(daily) > 1 else np.nan
     downside = float(np.sqrt((np.minimum(daily, 0) ** 2).mean()) * np.sqrt(YEAR))
-    drawdown, peak, trough = max_drawdown(curve)
-    cagr = growth ** (1 / years) - 1 if years > 0 and growth > 0 else np.nan
+    drawdown = path - path.cummax()
+    trough = drawdown.idxmin()
+    peak = path.loc[:trough].idxmax()
     result = {
-        "start": curve.index[0].date(), "end": curve.index[-1].date(),
-        "start_value": float(curve.iloc[0]), "final_value": float(curve.iloc[-1]),
-        "growth": growth, "total_return": growth - 1, "cagr": cagr, "log_growth": log_growth(curve),
-        "daily_return": float(daily.mean()), "volatility": volatility,
+        "start": path.index[0].date(), "end": path.index[-1].date(), "daily_return": float(daily.mean()),
+        "volatility": volatility,
         "sharpe": float(daily.mean() / daily.std(ddof=1) * np.sqrt(YEAR)) if volatility and volatility > 0 else np.nan,
         "sortino": float(daily.mean() * YEAR / downside) if downside > 0 else np.nan,
-        "max_drawdown": drawdown, "drawdown_peak": peak.date() if peak is not None else None,
-        "drawdown_trough": trough.date() if trough is not None else None,
-        "calmar": cagr / -drawdown if drawdown < 0 and np.isfinite(cagr) else np.nan,
+        "max_drawdown": float(drawdown.min()), "drawdown_peak": peak.date(), "drawdown_trough": trough.date(),
     }
-    if periods is not None and len(periods):
-        result.update({
-            "periods": len(periods), "period_hit_rate": float((periods.net_return > 0).mean()),
-            "avg_turnover": float(periods.turnover.mean()), "total_cost": float(periods.cost.sum()),
-            "total_borrow": float(periods.borrow.sum()), "avg_positions": float(periods.filled.mean()),
-        })
+    result.update(period_summary(periods))
     return result
 
 
-def relative(curve: pd.Series, benchmark: pd.Series) -> dict:
-    """Compare a curve with a benchmark's over the same opens: excess return, tracking and beta."""
-    joined = pd.concat([curve.pct_change(), benchmark.pct_change()], axis=1, join="inner").dropna()
+def relative_daily(path: pd.Series, reference: pd.Series) -> dict:
+    """Compare two cumulative returns on capital over the same opens: tracking error, information ratio and beta
+    of the daily changes."""
+    joined = pd.concat([path.diff(), reference.diff()], axis=1, join="inner").dropna()
     if len(joined) < 2:
         return {}
     active = joined.iloc[:, 0] - joined.iloc[:, 1]
     tracking = float(active.std(ddof=1) * np.sqrt(YEAR))
     variance = joined.iloc[:, 1].var(ddof=1)
-    return {"excess_return": float(curve.iloc[-1] / curve.iloc[0] - benchmark.iloc[-1] / benchmark.iloc[0]),
-            "tracking_error": tracking,
+    return {"tracking_error": tracking,
             "information_ratio": float(active.mean() * YEAR / tracking) if tracking > 0 else np.nan,
             "beta": float(joined.iloc[:, 0].cov(joined.iloc[:, 1]) / variance) if variance > 0 else np.nan}
 

@@ -93,8 +93,7 @@ def write_dividends(path: Path, dividends: list[tuple[str, str, float]], currenc
 
 def config(root: Path, **changes) -> BacktestConfig:
     defaults = dict(models=("flat",), ensembles=(), test_years=(2025,), null_seeds=2, strict_calendar=False,
-                    min_price=0.0, min_dollar_volume=0.0, cost_bps=0.0, sizes=(0.0, 0.25, 0.5), sweeps=1,
-                    bars_dir=root / "bars",
+                    min_price=0.0, min_dollar_volume=0.0, cost_bps=0.0, bars_dir=root / "bars",
                     news_dir=root / "news", splits_path=root / "splits.parquet", dividends_path=None,
                     actions_path=None, changes_path=None)
     return BacktestConfig(**(defaults | changes))
