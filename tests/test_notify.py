@@ -47,8 +47,8 @@ class EmailTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
-        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", min_dollar_volume=0.0,
-                                 refresh_time="off", smtp_host="smtp.example.com", smtp_user="bot@example.com",
+        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", sentiment_dir=root / "sentiment",
+                                 min_dollar_volume=0.0, refresh_time="off", smtp_host="smtp.example.com", smtp_user="bot@example.com",
                                  smtp_password="secret", email_to="me@example.com, team@example.com")
         write_bars(self.settings.bars_dir, "2026-10-16", {"BIG": (100, 1_000), "DUD": (30, 500)})
         FakeSMTP.sent, FakeSMTP.calls, FakeSMTP.tls = [], [], True

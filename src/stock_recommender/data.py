@@ -32,8 +32,24 @@ def read_bars(directory: Path, days: int) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
 
 
-def read_news(directory: Path, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Return the articles published in [start, end); both bounds are UTC timestamps."""
+def read_news(directory: Path, start: pd.Timestamp, end: pd.Timestamp, sentiment_dir: Path | None = None,
+              model: str | None = None) -> pd.DataFrame:
+    """Return the articles published in [start, end); both bounds are UTC timestamps.
+
+    With sentiment_dir, an llm_scores column holds each article's scores by `model` (sentiment.attach).
+    """
+    news = _read_news(directory, start, end)
+    if sentiment_dir is None:
+        return news
+    from .sentiment import attach, read_day, to_frame  # sentiment imports requests, which only this needs.
+
+    paths = [path for year in range(start.year, end.year + 1) for path in (Path(sentiment_dir) / str(year)).glob("*.parquet")
+             if start.date() <= date.fromisoformat(path.stem) <= end.date()]
+    scores = [read_day(path, model) for path in sorted(paths)]
+    return attach(news, pd.concat(scores, ignore_index=True) if scores else to_frame([]))
+
+
+def _read_news(directory: Path, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     files = [path for year in range(start.year, end.year + 1) for path in (Path(directory) / str(year)).glob("*.parquet")
              if start.date() <= date.fromisoformat(path.stem) <= end.date()]
     if not files:

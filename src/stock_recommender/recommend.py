@@ -25,6 +25,12 @@ class Recommendations:
     trades: pd.DataFrame  # The model's recommended buys: its best `picks` tickers with their price (as_of's close).
 
 
+def news_counts(news: pd.DataFrame) -> pd.Series:
+    """Return how many articles are tagged with each ticker; an article tagging a ticker twice counts once."""
+    tickers = news.tickers.map(lambda tags: [] if tags is None else list(dict.fromkeys(tags)))
+    return tickers.explode().dropna().value_counts()
+
+
 def news_cutoff(as_of: pd.Timestamp) -> pd.Timestamp:
     """Return as_of's 16:00 New York close, in UTC."""
     return pd.Timestamp(f"{as_of.date()} 16:00", tz="America/New_York").tz_convert("UTC")
@@ -68,7 +74,7 @@ def score_day(bars: pd.DataFrame, news: pd.DataFrame, as_of: pd.Timestamp, setti
         raise DataUnavailable(f"No ticker on {as_of.date()} passes the price and dollar volume filters.")
     scores = models.score(snapshot.bars, snapshot.news, snapshot.universe.index)
     table = snapshot.universe.join(scores, how="inner").assign(
-        news_count=snapshot.news.tickers.explode().value_counts().reindex(scores.index, fill_value=0))
+        news_count=news_counts(snapshot.news).reindex(scores.index, fill_value=0))
     # Equal scores, as from the placeholders, rank the more liquid stock first.
     table = table.rename_axis("ticker").reset_index().sort_values(
         ["score", "dollar_volume", "ticker"], ascending=[False, False, True], ignore_index=True)
@@ -87,7 +93,8 @@ def recommend(settings: Settings, models: Models) -> Recommendations:
     bars = read_bars(settings.bars_dir, models.bars_lookback)
     as_of = bars.date.max()
     cutoff = news_cutoff(as_of)
-    news = read_news(settings.news_dir, cutoff - pd.Timedelta(days=models.news_lookback_days), cutoff)
+    news = read_news(settings.news_dir, cutoff - pd.Timedelta(days=models.news_lookback_days), cutoff,
+                     settings.sentiment_dir, settings.ollama_model)
     return score_day(bars, news, as_of, settings, models)
 
 

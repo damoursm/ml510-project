@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable
 import numpy as np
 import pandas as pd
+from .. import sentiment
 from ..config import ROOT, Settings
 from ..data import DataUnavailable
 from ..ensemble import Ensemble
@@ -62,6 +63,10 @@ class BacktestConfig:
     null_seeds: int = 20  # Random lists of the same size, to see how a model ranks among no-skill ones.
     bars_dir: Path = ROOT / "data/raw/polygon/daily_bars_unadjusted"
     news_dir: Path = ROOT / "data/raw/polygon/news"
+    # The news' LLM scores (stock_recommender/sentiment.py) by sentiment_model, attached as llm_scores; None: none.
+    sentiment_dir: Path | None = ROOT / "data/processed/news_sentiment"
+    sentiment_model: str = "qwen3:8b"
+    sentiment_max_tickers: int = 5  # As Settings.sentiment_max_tickers: articles with more are never scored.
     splits_path: Path = ROOT / "data/raw/polygon/splits_2021_2025.parquet"
     dividends_path: Path | None = ROOT / "data/raw/polygon/dividends_2021_2025.parquet"  # None: price returns.
     # Spin-offs and cash deals missing from Polygon's records (None leaves them out).
@@ -130,7 +135,8 @@ class BacktestResult:
 
 def load_data(config: BacktestConfig) -> tuple[WindowedStore, Panel, pd.DataFrame]:
     """Read the 2021-2025 bars, splits, dividends and news through the window's guarded store."""
-    store = WindowedStore(config.bars_dir, config.news_dir, config.splits_path)
+    store = WindowedStore(config.bars_dir, config.news_dir, config.splits_path, config.sentiment_dir,
+                          config.sentiment_model)
     panel = Panel.load(store, config.strict_calendar, config.dividends_path, config.actions_path,
                        config.changes_path)
     return store, panel, store.read_news()
@@ -359,6 +365,18 @@ def chain(ledgers: list[Ledger]) -> tuple[pd.Series, pd.Series]:
     return pd.concat(profits).rename("profit"), pd.concat(paths).rename("return")
 
 
+def _scored_by_year(news: pd.DataFrame, max_tickers: int) -> dict:
+    """The share of each year's eligible articles (sentiment.eligible: the ones scoring sends) that have an LLM score
+    for every ticker they are scored for (sentiment.targets): 1.0 once a year is fully scored."""
+    if not len(news) or "llm_scores" not in news:
+        return {}
+    sent = news[sentiment.eligible(news, max_tickers)]
+    full = pd.Series([scores is not None and len(scores) == len(sentiment.targets(tickers))
+                      for scores, tickers in zip(sent.llm_scores, sent.tickers)], index=sent.index, dtype=bool)
+    scored = full.groupby(sent.published_utc.dt.year).mean()
+    return {str(year): round(float(share), 4) for year, share in scored.items()}
+
+
 def _mean(values) -> float:
     values = [value for value in values if pd.notna(value)]
     return float(np.mean(values)) if values else np.nan
@@ -570,7 +588,8 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
               "dividends_rekeyed": int(dividends.rekeyed_from.notna().sum()) if len(dividends) else 0,
               "dividends_by_reason": dividends.reason.value_counts().to_dict() if len(dividends) else {},
               "curated_actions_applied": int(panel.action_audit.applied.sum()) if len(panel.action_audit) else 0,
-              "returns": "total (dividends reinvested)" if config.dividends_path else "price only"}
+              "returns": "total (dividends reinvested)" if config.dividends_path else "price only",
+              "news_scored_by_year": _scored_by_year(news, config.sentiment_max_tickers)}
     if max_exit > LAST_DAY or panel.sessions.max().date() > LAST_DAY or (len(news) and news.published_utc.max() >= END_UTC):
         raise LeakageError(f"The backtest reached past {LAST_DAY}: {guards}")
     profit = pd.DataFrame({name: chained[name][0] for name in yearly})

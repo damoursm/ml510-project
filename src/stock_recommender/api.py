@@ -38,9 +38,12 @@ class LatestRecommendations:
         self._result: tuple[Recommendations, datetime] | None = None
 
     def _input_files(self) -> tuple:
-        # The news files in the window, plus slack for days stored after as_of (weekends, lagging bars).
+        # The news files in the window, plus slack for days stored after as_of (weekends, lagging bars), and
+        # their LLM scores.
+        news_days = self.models.news_lookback_days + 5
         files = (recent_day_files(self.settings.bars_dir, self.models.bars_lookback)
-                 + recent_day_files(self.settings.news_dir, self.models.news_lookback_days + 5))
+                 + recent_day_files(self.settings.news_dir, news_days)
+                 + recent_day_files(self.settings.sentiment_dir, news_days))
         return tuple((str(path), path.stat().st_mtime_ns) for path in files)
 
     def get(self) -> tuple[Recommendations, datetime]:

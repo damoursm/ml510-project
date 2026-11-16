@@ -82,6 +82,127 @@ pulling or switching branches (`Stop-ScheduledTask` then `Start-ScheduledTask` w
 asleep at 16:00 fetches and emails when it wakes. `-Python` picks another interpreter than Miniconda's
 `pythonw.exe`.
 
+## News sentiment from a local LLM
+
+`stock_recommender/sentiment.py` scores each article with a model served by [Ollama](https://ollama.com) on this
+computer (`qwen3:8b` by default). For each article tagged with 1 to 5 companies, it rates every one of them:
+- event (earnings, guidance, analyst, deal, product, legal, management, capital, price_move, opinion, macro, other);
+- relevance (0 mentioned, 1 a main subject, 2 about it);
+- impact (0 nothing new, 1 routine, 2 major news);
+- sentiment (-2 to 2).
+
+Each company counts once (`CMCS.A` and `CMCSA` are one). Securities other than common shares don't count: preferred
+shares, warrants, rights, units and when-issued shares. Polygon names them `JPMpC`, `IONQ.WS`, `SOULr`, `AIIA.U` and
+`DDw` on NYSE. On Nasdaq they are a fifth letter after the issuer's ticker (`AGNCP`, `SOUNW`, `PRSRU`), dropped when
+that ticker is tagged too; `GOOGL` and `LILAK` are share classes and stay. Polygon tags 675 of 2021-2025's JPM
+articles with its six preferreds, which would otherwise push them past the limit. Articles with more companies
+(roundups, lists) are not scored.
+
+Only the stocks the recommender may trade are scored: a tagged stock that passes its filters (price and median dollar
+volume, `min_price` and `min_dollar_volume`) on a session in the 8 days from the article's day, the days the news
+features read it. That leaves out 15% of the 2021-2025 articles and a share of the companies of the others; those
+companies are still hidden from the model. The filter reads the daily bars as traded
+(`data/raw/polygon/daily_bars_unadjusted`, then the API's bars for the days it lacks), and on the latest day it gives
+the recommender's universe exactly. Lowering the filters later only needs another `score_news.py` run, which scores
+the stocks that became tradable; `--all-tickers` scores every tagged company.
+
+The model sees only the title and summary, with summaries cut at 12,000 characters. Its answer is forced into a JSON
+schema, with no thinking, at temperature 0, and asked for on one line: generating the answer is nearly all the time
+a request takes, and pretty-printed JSON doubled its tokens. Requests use an 8,192-token context: that matches how
+the llm_trader project runs the shared Ollama server, and Ollama would reload the model for another value.
+
+The model does not see which company an article is about, or when it was written. Qwen3 was released in April
+2025, so it may know what happened after most of the 2021-2025 news to a company it recognizes, or after a date it
+reads. `stock_recommender/anonymize.py` rewrites each article before the model sees it:
+
+- The scored companies become Company A, Company B...: their tickers, wherever they are written (`NYSE: F`, `$F`,
+  `(F)`, `TECK.B`, `F stock`, "T, F and GM"), and their names. The two share classes of one company get one
+  placeholder and one score.
+- Every other company the text names gets the next placeholders: a ticker written after a market or a dollar sign,
+  a name written before a ticker in brackets ("Li Auto Inc. (NASDAQ: LI)"), and the names and tickers the table
+  marks as safe to hide in any article (Morgan Stanley, Apple, NVDA). The model is told to label only the listed
+  companies.
+- Dates go: "March 15, 2023", "15 mars 2023" and "3/15/2023" become `[date]`, "in March" `in [month]`, 2023 `20XX`
+  (FY23 `FY 20XX`, '21 `'XX`), and the dateline of a press release ("DUNMORE, Pa., April 21, 2023 (GLOBE NEWSWIRE)
+  --") is dropped. Relative times stay: last year, next quarter, Q3, Monday.
+- Web addresses, e-mails, social handles and security codes (ISIN, CUSIP, WKN) become `[link]`, `[email]`,
+  `[handle]` and `[code]`: they carry names and tickers.
+
+"Ford (F) beat Q3 2023 estimates on March 15" reaches the model as "Company A beat Q3 20XX estimates on [date]",
+and the prompt asks what the text says, not for a forecast. A scored company the text never names gets relevance 0.
+
+The names to hide come from a table of aliases, built once from two sources:
+
+```bash
+python scripts/download_ticker_names.py    # every name Polygon gave each ticker since 2021, exchanges and OTC
+python scripts/build_ticker_aliases.py     # the aliases the 2021-2025 news confirm, into data/processed
+```
+
+An alias is Polygon's name without its legal ending (Ford Motor), its first words (Ford), its other words (Disney),
+its initials (TSMC, P&G), a name the news write before the ticker in parentheses ("Coke (KO)"), or the ticker
+itself. The news decide which are kept. "American" is not hidden for American Airlines, nor "Solar" for First Solar:
+most articles that contain them are about something else. "Target" is hidden except beside the words it forms other
+names with in other articles ("Price Target"). A name its own articles write small (lululemon) is hidden written
+small too. An alias applies to its ticker's articles from the day Polygon first gave that name, or the news first
+wrote it before the ticker, since tickers pass from one company to another. The article itself adds names: the words
+before its ticker in brackets, and the short names a press release defines ("Evergold" or the "Company"). Scoring
+refuses to start without the table, or with one built for an older version of the masking.
+
+Polygon tags some articles about a foreign company with a US ticker it shares: Boralex (TSX: BLX) with Bladex,
+Saputo (TSX: SAP) with SAP. When the scored ticker is written only after a foreign market and the article never
+names the scored company, the foreign company gets its own placeholder, so the scored one gets relevance 0.
+
+What stays: a ticker that is also a word where the text uses the word ("artificial intelligence (AI)", "Houston,
+TX"); a single letter where it is one (Plan B, Class C, F-150); another company's name after a first name
+("Harrison Ford") or inside a place ("New Brunswick"); products (iPhone), people (Elon Musk), places and well-known
+events; companies listed only abroad, which Polygon does not name (Commonwealth Bank of Australia, SK Hynix);
+brokers' brands (RBC Capital Markets, BMO, TD Cowen). Rebuild the table now and then for new listings; scores
+already stored keep the aliases they were made with.
+
+A malformed or partial answer is asked again with sampling, with seeds that differ from run to run. A ticker still
+unscored after 3 requests gets no score, and the next run asks again. One article the server can't answer doesn't
+stop the run. A server that is down stops it, and so does one that leaves 12 articles in a row unanswered.
+
+Scores go to `data/processed/news_sentiment/<year>/<day>.parquet`, one file per news day. Each row records the model,
+its digest (the exact weights) and the prompt version. Changing the prompt means bumping `PROMPT_VERSION`: the stored
+scores become stale and everything is scored again, but the old rows stay in the files, as do other models' rows.
+
+`model_digests.json` in that directory records the weights the scores come from. If `qwen3:8b` is pulled again, every
+run refuses to start, the daily refresh included, until you restore the old weights or accept the new ones once with
+`python scripts/score_news.py --allow-new-digest --start <today> --end <today>`. Use a recent range, so no older
+article is scored with the new weights. A run also stops if the weights change while it runs.
+
+```bash
+python scripts/score_news.py --dry-run             # what 2021-2025 holds to score, and how long it would take
+python scripts/score_news.py --retry-minutes 10    # score 2021-2025: days of GPU time; resumes where it stopped
+```
+
+With `--retry-minutes`, a run left alone waits and goes on when Ollama restarts, instead of stopping.
+
+The daily refresh scores the new articles after downloading them (`RECOMMENDER_SCORE_NEWS=false` turns that off), so
+Ollama must be running at 16:00; if it is not, the refresh reports the error and those articles stay unscored until
+the next run. `RECOMMENDER_OLLAMA_URL`, `RECOMMENDER_OLLAMA_MODEL`, `RECOMMENDER_SENTIMENT_MAX_TICKERS` and
+`RECOMMENDER_SENTIMENT_WORKERS` change the server, the model, the ticker limit and the requests sent at once.
+
+`stock_recommender/news_features.py` turns the scores into eight features per stock and decision. They read the
+articles published in the 7 days before the decision's 16:00 close, and "1d" ones those since the previous weekday's
+close:
+- article counts over 7 days and 1 day;
+- sentiment weighted by relevance, over 7 days and 1 day;
+- the sentiment of major news;
+- the highest impact;
+- whether there was earnings or guidance news;
+- the sentiment of analyst actions.
+
+`decision_news_features(news, tickers, cutoff)` computes them for a decision. `training_news_features(data)` computes
+them in `fit`, next to the labels. Both give the same values for the same day and read no later article. The
+backtest reads the scores through its 2021-2025 store, like the news, and `guards.json` shows the share of each
+year's scorable articles (1 to 5 companies) that have a score for every company: 1.0 once a year is fully scored.
+
+One caveat: an LLM can know what happened after an article. Hiding the companies and the years removes most of what
+it could recognize, not all of it, and nothing here measures what is left. A backtest of 2021-2024 can therefore
+still look better than live trading; late 2025 and the 2026 final test are cleaner, since Qwen3 cannot have seen them.
+
 ## Backtesting (2021-2025 only)
 
 `src/stock_recommender/backtest` replays the API's own decisions over history to measure the yearly return of

@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from ..data import NEWS_COLUMNS
+from .. import sentiment
 
 FIRST_DAY = date(2021, 1, 1)
 LAST_DAY = date(2025, 12, 31)
@@ -58,8 +59,13 @@ def day_files(directory: Path) -> dict[date, Path]:
 class WindowedStore:
     """Reads a backtest's bars, splits and news from inside the window, and records every file it opens."""
 
-    def __init__(self, bars_dir: Path, news_dir: Path, splits_path: Path):
+    def __init__(self, bars_dir: Path, news_dir: Path, splits_path: Path, sentiment_dir: Path | None = None,
+                 sentiment_model: str | None = None):
+        """sentiment_dir holds the news' LLM scores (stock_recommender/sentiment.py); those by sentiment_model
+        under the current prompt are attached to the news as llm_scores. None reads no scores."""
         self.bars_dir, self.news_dir, self.splits_path = Path(bars_dir), Path(news_dir), Path(splits_path)
+        self.sentiment_dir = None if sentiment_dir is None else Path(sentiment_dir)
+        self.sentiment_model = sentiment_model
         self.opened: list[Path] = []
 
     def _read(self, path: Path, day: date | None, columns: list[str] | None = None) -> pa.Table:
@@ -163,18 +169,38 @@ class WindowedStore:
         return table
 
     def read_news(self) -> pd.DataFrame:
-        """Return every article published in 2021-2025 (UTC), sorted by publication time."""
+        """Return every article published in 2021-2025 (UTC), sorted by publication time, with their LLM scores
+        (llm_scores) when the store has a sentiment_dir."""
         files = day_files(self.news_dir)
         if not files:
-            return pd.DataFrame(columns=NEWS_COLUMNS).astype({"published_utc": "datetime64[ms, UTC]"})
-        with ThreadPoolExecutor(8) as pool:
-            tables = list(pool.map(lambda item: self._read_news_day(*item), files.items()))
-        news = pa.concat_tables(tables).to_pandas()
-        # Arrow hands each list cell out as a view into one buffer of every article; give each cell its own
-        # storage, so no slice of the news can reach later articles.
-        for column in ("tickers", "keywords", "insights"):
-            news[column] = [cell.copy() if isinstance(cell, np.ndarray) else cell for cell in news[column]]
-        return news.sort_values("published_utc", kind="stable", ignore_index=True)
+            news = pd.DataFrame(columns=NEWS_COLUMNS).astype({"published_utc": "datetime64[ms, UTC]"})
+        else:
+            with ThreadPoolExecutor(8) as pool:
+                tables = list(pool.map(lambda item: self._read_news_day(*item), files.items()))
+            news = pa.concat_tables(tables).to_pandas()
+            # Arrow hands each list cell out as a view into one buffer of every article; give each cell its own
+            # storage, so no slice of the news can reach later articles.
+            for column in ("tickers", "keywords", "insights"):
+                news[column] = [cell.copy() if isinstance(cell, np.ndarray) else cell for cell in news[column]]
+            news = news.sort_values("published_utc", kind="stable", ignore_index=True)
+        if self.sentiment_dir is None:
+            return news
+        return sentiment.attach(news, self.read_sentiment())
+
+    def _read_sentiment_day(self, day: date, path: Path) -> pd.DataFrame:
+        scores = sentiment.current(self._read(path, day).to_pandas(), self.sentiment_model)
+        if len(scores):
+            start, low, high = pd.Timestamp(day, tz="UTC"), scores.published_utc.min(), scores.published_utc.max()
+            if low < start or high >= min(start + pd.Timedelta(days=1), END_UTC):
+                raise LeakageError(f"{path} scores articles published {low}..{high}, not only on {day} (UTC).")
+        return scores
+
+    def read_sentiment(self) -> pd.DataFrame:
+        """Return the LLM scores of the articles published in 2021-2025 (UTC) by sentiment_model, under the
+        current prompt (sentiment.PROMPT_VERSION)."""
+        files = day_files(self.sentiment_dir) if self.sentiment_dir is not None else {}
+        frames = [frame for frame in (self._read_sentiment_day(day, path) for day, path in files.items()) if len(frame)]
+        return pd.concat(frames, ignore_index=True) if frames else sentiment.to_frame([])
 
     def audit(self) -> dict:
         """Count the files opened and check that none is outside the window."""

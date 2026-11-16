@@ -77,12 +77,24 @@ class DailyRefresh:
         # request or on waking from sleep, stops at the last complete day. The scripts fetch again a day stored
         # before it ended.
         today = ["--include-today"] if after_close(now) else []
-        return [
+        commands = [
             [sys.executable, str(ROOT / "scripts/download_daily_bars.py"), "--out", str(self.settings.bars_dir),
              "--start", start, "--redownload", str(bars_days), *today],
             [sys.executable, str(ROOT / "scripts/download_news.py"), "--out", str(self.settings.news_dir),
              "--start", start, *today],
         ]
+        if self.settings.score_news:
+            # The days of news the models read and a few more, by UTC day like the news files: the articles
+            # fetched since the last run are scored, the others already are.
+            utc_today = now.astimezone(timezone.utc).date()
+            first = utc_today - timedelta(days=self.latest.models.news_lookback_days + 3)
+            commands.append([
+                sys.executable, str(ROOT / "scripts/score_news.py"), "--news-dir", str(self.settings.news_dir),
+                "--out", str(self.settings.sentiment_dir), "--start", str(first), "--end", str(utc_today),
+                "--url", self.settings.ollama_url, "--model", self.settings.ollama_model,
+                "--max-tickers", str(self.settings.sentiment_max_tickers),
+                "--workers", str(self.settings.sentiment_workers)])
+        return commands
 
     def missed_run(self, now: datetime) -> bool:
         """Whether the bars were not rewritten since the last scheduled run, e.g. because the API was off."""

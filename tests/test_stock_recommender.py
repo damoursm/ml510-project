@@ -12,6 +12,7 @@ with warnings.catch_warnings():
 from stock_recommender.api import create_app
 from stock_recommender.config import ROOT, Settings
 from stock_recommender.models import load_models
+from stock_recommender.recommend import news_counts
 
 
 def write_bars(directory: Path, day: str, rows: dict[str, tuple[float, float]]):
@@ -52,7 +53,8 @@ class RecommendationsApiTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
-        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", top_n=10, min_price=5.0,
+        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", sentiment_dir=root / "sentiment",
+                                 top_n=10, min_price=5.0,
                                  min_dollar_volume=1_000.0, refresh_time="")
         # BIG trades more dollars than ACME but sorts after it; PENNY is too cheap; THIN too illiquid;
         # GONE stopped trading; ZVZZT is an exchange test symbol.
@@ -167,6 +169,13 @@ class RecommendationsApiTest(unittest.TestCase):
         self.assertEqual(settings.top_n, 3)
         self.assertEqual(settings.news_dir, ROOT / "elsewhere")  # The download scripts write there too.
         self.assertEqual(settings.bars_dir, Path(absolute))
+
+
+class NewsCountsTest(unittest.TestCase):
+    def test_an_article_tagging_a_ticker_twice_counts_once(self):
+        news = pd.DataFrame({"tickers": [["AAA", "AAA", "BBB"], None, ["AAA"], []]})
+        self.assertEqual(news_counts(news).to_dict(), {"AAA": 2, "BBB": 1})
+        self.assertEqual(len(news_counts(news.iloc[:0])), 0)
 
 
 if __name__ == "__main__":

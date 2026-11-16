@@ -11,6 +11,17 @@ ROOT = Path(__file__).resolve().parents[2]
 class Settings:
     bars_dir: Path = ROOT / "data/raw/polygon/daily_bars"
     news_dir: Path = ROOT / "data/raw/polygon/news"
+    # News scored by a local LLM (stock_recommender/sentiment.py): one file per news day, scored by ollama_model.
+    sentiment_dir: Path = ROOT / "data/processed/news_sentiment"
+    # Every name each ticker had (scripts/download_ticker_names.py): scoring hides the companies from the LLM.
+    ticker_names_path: Path = ROOT / "data/raw/polygon/ticker_names.parquet"
+    # The names of each ticker's company that scoring hides (scripts/build_ticker_aliases.py).
+    ticker_aliases_path: Path = ROOT / "data/processed/ticker_aliases.parquet"
+    ollama_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen3:8b"
+    sentiment_max_tickers: int = 5  # Articles tagged with more tickers (roundups, lists) are not scored.
+    sentiment_workers: int = 4  # Articles sent to Ollama at once.
+    score_news: bool = True  # Score the new articles after each refresh's downloads; needs Ollama running.
     top_n: int = 20  # Stocks in each of the buy and sell lists when the request gives no limit.
     min_price: float = 5.0  # Last close, in dollars; excludes penny stocks.
     min_dollar_volume: float = 1_000_000.0  # Median daily close * volume over the bars window.

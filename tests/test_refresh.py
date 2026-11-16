@@ -47,7 +47,8 @@ class DailyRefreshTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
-        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", min_dollar_volume=0.0)
+        self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", sentiment_dir=root / "sentiment",
+                                 min_dollar_volume=0.0, score_news=False)
         write_bars(self.settings.bars_dir, "2026-10-16", {"BIG": (100, 1_000)})
         self.latest = LatestRecommendations(self.settings, load_models())
         self.refresh = DailyRefresh(self.settings, self.latest)
@@ -62,11 +63,18 @@ class DailyRefreshTest(unittest.TestCase):
         return str(self.latest.get()[0].as_of.date())
 
     def test_commands_fetch_today_only_after_the_close(self):
-        bars, news = self.refresh.commands(new_york(2026, 10, 23, 16, 0))
+        scoring = DailyRefresh(replace(self.settings, score_news=True), self.latest)
+        bars, news, score = scoring.commands(new_york(2026, 10, 23, 16, 0))
         self.assertEqual(bars[1:], [str(ROOT / "scripts/download_daily_bars.py"), "--out", str(self.settings.bars_dir),
                                     "--start", "2026-04-26", "--redownload", "90", "--include-today"])
         self.assertEqual(news[1:], [str(ROOT / "scripts/download_news.py"), "--out", str(self.settings.news_dir),
                                     "--start", "2026-04-26", "--include-today"])
+        # Then the LLM scores the articles of the news window, by UTC day (16:00 New York is 20:00 UTC).
+        self.assertEqual(score[1:], [str(ROOT / "scripts/score_news.py"), "--news-dir", str(self.settings.news_dir),
+                                     "--out", str(self.settings.sentiment_dir), "--start", "2026-10-13",
+                                     "--end", "2026-10-23", "--url", "http://localhost:11434", "--model", "qwen3:8b",
+                                     "--max-tickers", "5", "--workers", "4"])
+        self.assertEqual(len(self.refresh.commands(new_york(2026, 10, 23, 16, 0))), 2)  # score_news off.
         # A run that fires mid-session, e.g. on waking from sleep, must not store the session so far.
         for command in self.refresh.commands(new_york(2026, 10, 26, 10, 30)):
             self.assertNotIn("--include-today", command)
