@@ -390,7 +390,7 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
     candidates = _candidates(config, factories, grids)
     by_label = {candidate.label: candidate for candidate in candidates}
     store, panel, news = data or load_data(config)
-    settings = Settings(min_price=config.min_price, min_dollar_volume=config.min_dollar_volume, refresh_time="off")
+    settings = Settings(min_price=config.min_price, min_dollar_volume=config.min_dollar_volume)
     folds = walk_forward(panel.sessions, config.test_years)
     years = [fold.year for fold in folds]
     specs = {candidate.label: (candidate.model, dict(candidate.params)) for candidate in candidates}

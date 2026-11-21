@@ -15,6 +15,7 @@ Never register load_models(): once it loads models trained on 2021-2025, a backt
 """
 from dataclasses import fields, replace
 from itertools import product
+from ..forest import ForestPriceModel
 from ..models import Models, placeholder_models
 
 MODEL_FIELDS = frozenset(field.name for field in fields(Models))
@@ -26,9 +27,19 @@ def most_liquid_models() -> Models:
     return replace(placeholder_models(), version="most_liquid")
 
 
-MODELS = {"most_liquid": most_liquid_models}
+def random_forest_models(min_samples_leaf: int = 1_000, max_features: float = 0.5) -> Models:
+    """Recommend the stocks a random forest on the ten daily-bar features expects to beat the others most over the
+    horizon (forest.py); no news. Its 20 best picks, held 5 sessions, from 60 sessions of bars."""
+    price = ForestPriceModel(min_samples_leaf=min_samples_leaf, max_features=max_features)
+    return replace(placeholder_models(), price=price,
+                   version=f"random_forest(min_samples_leaf={min_samples_leaf},max_features={max_features})")
 
-GRIDS: dict[str, dict] = {}  # most_liquid has no hyperparameters: it recommends its 20 most liquid stocks.
+
+MODELS = {"most_liquid": most_liquid_models, "random_forest": random_forest_models}
+
+GRIDS: dict[str, dict] = {  # most_liquid has no hyperparameters: it recommends its 20 most liquid stocks.
+    "random_forest": {"min_samples_leaf": (1_000, 250), "max_features": (0.5, 1.0)},
+}
 UNTUNED = frozenset({"picks"})  # Fields no grid may name.
 
 

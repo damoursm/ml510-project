@@ -183,6 +183,20 @@ class ScorerTest(unittest.TestCase):
         self.assertNotIn("x" * (sentiment.MAX_SUMMARY_CHARS + 1), content)
         self.assertNotIn("t" * (sentiment.MAX_TITLE_CHARS + 1), content)
 
+    def test_a_smaller_context_is_requested_and_an_article_that_might_not_fit_it_waits(self):
+        session = FakeSession([answer((A, "other", 0, 0, 0))])
+        scorer = OllamaScorer(session=session, num_ctx=4096)
+        self.assertEqual(scorer.score_article("t", "x" * 1_000, ["AAPL"]), {"AAPL": values("other", 0, 0, 0)})
+        self.assertEqual(session.bodies[0]["options"]["num_ctx"], 4096)
+        # Could pass 4096 tokens at the fewest characters a token: not sent, so it stays unscored for a later run.
+        self.assertEqual(scorer.score_article("t", "x" * 6_000, ["AAPL"]), {})
+        self.assertEqual(len(session.bodies), 1)
+        # At NUM_CTX the same article is sent: the cuts make every prompt fit.
+        session = FakeSession([answer((A, "other", 0, 0, 0))])
+        self.assertEqual(OllamaScorer(session=session).score_article("t", "x" * 6_000, ["AAPL"]),
+                         {"AAPL": values("other", 0, 0, 0)})
+        self.assertEqual(session.bodies[0]["options"]["num_ctx"], sentiment.NUM_CTX)
+
     def test_a_malformed_or_partial_answer_is_resampled_and_the_answers_merge(self):
         session = FakeSession(["oops", answer((A, "other", 1, 0, 0)), answer((B, "deal", 2, 1, 1))])
         first = OllamaScorer(session=session)
@@ -546,6 +560,13 @@ class ScoreNewsScriptTest(unittest.TestCase):
         self.session.down = True  # Without it, the run stops.
         write_news(self.root / "news", [("2025-03-12 14:00", ["AAA"])])
         self.assertEqual(self.run_script("--start", "2025-03-10", "--end", "2025-03-12")[0], 2)
+
+    def test_a_smaller_context_reaches_the_requests(self):
+        write_news(self.root / "news", [("2025-03-10 14:00", ["AAA"])])
+        self.assertEqual(self.run_script("--start", "2025-03-10", "--end", "2025-03-10", "--num-ctx", "4096")[0], 0)
+        self.assertEqual(self.session.bodies[0]["options"]["num_ctx"], 4096)
+        with self.assertRaises(SystemExit):  # Too small for the instructions.
+            self.run_script("--start", "2025-03-10", "--end", "2025-03-10", "--num-ctx", "1024")
 
 
 class PromptTest(unittest.TestCase):

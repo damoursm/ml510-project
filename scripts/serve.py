@@ -2,7 +2,7 @@
 scripts/install_task.ps1 registers runs this with pythonw.
 
 Exits at once if something already listens on the port, e.g. an API started by hand, so that a single
-instance runs the daily refresh.
+instance downloads the data it is asked to fetch.
 
     pythonw scripts/serve.py [--port 8000]
 """

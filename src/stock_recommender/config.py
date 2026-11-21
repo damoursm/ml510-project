@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
+DASHBOARD_DIR = ROOT / "data/processed/dashboard"  # Where the API writes the dashboard (dashboard.py) by default.
 
 
 @dataclass(frozen=True)
@@ -25,16 +26,20 @@ class Settings:
     top_n: int = 20  # Stocks in each of the buy and sell lists when the request gives no limit.
     min_price: float = 5.0  # Last close, in dollars; excludes penny stocks.
     min_dollar_volume: float = 1_000_000.0  # Median daily close * volume over the bars window.
-    refresh_time: str = "16:00"  # HH:MM each weekday to download the day's bars and news; "off" to disable.
-    refresh_timezone: str = "America/New_York"
-    # Email server, e.g. smtp.gmail.com with an app password; email is off until smtp_host and email_to are set.
+    # Email server, e.g. smtp.gmail.com with an app password, through which the API sends the lists it is asked to.
     smtp_host: str = ""
     smtp_port: int = 587  # 465 for implicit TLS; otherwise STARTTLS when the server offers it.
     smtp_user: str = ""
     smtp_password: str = field(default="", repr=False)
     email_from: str = ""  # Defaults to smtp_user.
-    email_to: str = ""  # Comma-separated recipients.
-    email_daily: bool = True  # Email the top_n lists after each scheduled refresh, once email is configured.
+    # Comma-separated recipients that the 16:00 email task (scripts/email_recommendations.py) asks the API to email.
+    email_to: str = ""
+    # The backtest run whose final selection, the best combination of models, the API serves in place of
+    # load_models() (served_models.py): artifacts/<label>/<stamp>, or its selection.json, relative to the repository.
+    model_run: str = ""
+    # The dashboard's folder (dashboard.py), written at every call of the recommendations; None turns it off.
+    # from_env() gives DASHBOARD_DIR unless RECOMMENDER_DASHBOARD_DIR is set (empty turns it off).
+    dashboard_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -46,7 +51,9 @@ class Settings:
         values = {}
         for setting in fields(cls):
             raw = os.environ.get(f"RECOMMENDER_{setting.name.upper()}")
-            if raw is not None:
+            if setting.name == "dashboard_dir":  # On by default for the API; an empty value turns it off.
+                values[setting.name] = DASHBOARD_DIR if raw is None else ROOT / raw if raw.strip() else None
+            elif raw is not None:
                 # A relative path is relative to the repository, like .env and the download scripts' outputs.
                 if setting.type is Path:
                     values[setting.name] = ROOT / raw

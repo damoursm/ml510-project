@@ -1,4 +1,7 @@
-"""Download new bars and news, on request and every weekday at a set time, inside the API process."""
+"""Download new bars and news when a request asks to fetch them (POST /recommendations/latest?fetch=true).
+
+The API runs nothing on a schedule: the 16:00 email task (scripts/email_recommendations.py) calls it with fetch=true.
+"""
 from datetime import datetime, timedelta, timezone
 import logging
 import math
@@ -6,29 +9,11 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-import time
 from zoneinfo import ZoneInfo
 from .config import ROOT, Settings
-from .data import recent_day_files
 
 log = logging.getLogger("uvicorn.error")  # Uvicorn's general logger, which its console handler prints.
 NEW_YORK = ZoneInfo("America/New_York")
-
-
-def clock(at: str) -> tuple[int, int]:
-    hour, minute = map(int, at.split(":"))
-    return hour, minute
-
-
-def next_run(now: datetime, at: str) -> datetime:
-    """Return the first weekday at `at` (HH:MM) strictly after now, in now's time zone."""
-    hour, minute = clock(at)
-    run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if run <= now:
-        run += timedelta(days=1)  # Wall-clock arithmetic, so the time of day holds across DST changes.
-    while run.weekday() >= 5:
-        run += timedelta(days=1)
-    return run
 
 
 def after_close(now: datetime) -> bool:
@@ -36,38 +21,15 @@ def after_close(now: datetime) -> bool:
     return now.astimezone(NEW_YORK).hour >= 16
 
 
-def previous_run(now: datetime, at: str) -> datetime:
-    """Return the last weekday at `at` (HH:MM) at or before now, in now's time zone."""
-    hour, minute = clock(at)
-    run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if run > now:
-        run -= timedelta(days=1)
-    while run.weekday() >= 5:
-        run -= timedelta(days=1)
-    return run
+class Refresh:
+    """Runs the download scripts, then recomputes the recommendations. The API keeps serving the previous
+    recommendations while the scripts rewrite the files; status() reports the last run for /health."""
 
-
-class DailyRefresh:
-    """Runs the download scripts, then recomputes the recommendations: on request (run_once), and each weekday
-    at settings.refresh_time unless it is "off".
-
-    A scheduled run missed while the API was off happens at startup. The API keeps serving the previous
-    recommendations while the scripts rewrite the files. After each scheduled run, after_scheduled_run(errors)
-    is called, e.g. to email the new recommendations; its return value is stored as last_run["after"].
-    """
-
-    def __init__(self, settings: Settings, latest, after_scheduled_run=None):
+    def __init__(self, settings: Settings, latest):
         self.settings = settings
         self.latest = latest
-        self.after_scheduled_run = after_scheduled_run
-        self.zone = ZoneInfo(settings.refresh_timezone)
-        self.scheduled = settings.refresh_time.lower() not in ("", "off")
-        if self.scheduled:
-            next_run(datetime.now(self.zone), settings.refresh_time)  # Reject a malformed time at startup.
         self.last_run: dict | None = None
         self._running = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="daily-refresh", daemon=True)
 
     def commands(self, now: datetime) -> list[list[str]]:
         # Weekdays covering the price model's window plus holidays, rewritten onto one split adjustment.
@@ -96,12 +58,6 @@ class DailyRefresh:
                 "--workers", str(self.settings.sentiment_workers)])
         return commands
 
-    def missed_run(self, now: datetime) -> bool:
-        """Whether the bars were not rewritten since the last scheduled run, e.g. because the API was off."""
-        newest = recent_day_files(self.settings.bars_dir, 1)
-        due = previous_run(now, self.settings.refresh_time)
-        return not newest or newest[0].stat().st_mtime < due.timestamp()
-
     def run_once(self) -> list[str]:
         """Download, recompute, and return the errors.
 
@@ -112,14 +68,14 @@ class DailyRefresh:
         if waited:
             self._running.acquire()
         try:
-            if waited and self.last_run and (self.last_run["included_today"] or not after_close(datetime.now(self.zone))):
+            if waited and self.last_run and (self.last_run["included_today"] or not after_close(datetime.now(NEW_YORK))):
                 return self.last_run["errors"]
             return self._run()
         finally:
             self._running.release()
 
     def _run(self) -> list[str]:
-        now = datetime.now(self.zone)
+        now = datetime.now(NEW_YORK)
         included_today = after_close(now)
         errors = []
         self.latest.refreshing.set()
@@ -149,48 +105,5 @@ class DailyRefresh:
                          "included_today": included_today, "errors": errors}
         return errors
 
-    def _run_logged(self) -> None:
-        try:
-            errors = self.run_once()
-        except Exception:  # Keep the schedule alive for the next day.
-            log.exception("Refresh failed")
-            errors = ["refresh: see the log"]
-        if self.after_scheduled_run is None:
-            return
-        try:
-            after = self.after_scheduled_run(errors)
-        except Exception:
-            log.exception("After the refresh, failed")
-            after = {"error": "see the log"}
-        if self.last_run is not None:
-            self.last_run["after"] = after
-
-    def _loop(self) -> None:
-        started = datetime.now(self.zone)
-        if self.missed_run(started):
-            self._run_logged()
-        while True:
-            # Scheduled from when the last run started, so a run that crosses the refresh time is followed by one.
-            run = next_run(started, self.settings.refresh_time)
-            # Short waits against the wall clock stay on time across sleep or hibernation.
-            while (remaining := run.timestamp() - time.time()) > 0:
-                if self._stop.wait(min(remaining, 60)):
-                    return
-            started = datetime.now(self.zone)
-            self._run_logged()
-
-    def start(self) -> None:
-        if self.scheduled:
-            self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=5)
-
     def status(self) -> dict:
-        if not self.scheduled:
-            return {"schedule": None, "next_run": None, "last_run": self.last_run}
-        return {"schedule": f"weekdays at {self.settings.refresh_time} {self.settings.refresh_timezone}",
-                "next_run": next_run(datetime.now(self.zone), self.settings.refresh_time),
-                "last_run": self.last_run}
+        return {"last_run": self.last_run}

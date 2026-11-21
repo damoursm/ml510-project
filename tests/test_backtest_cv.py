@@ -293,7 +293,7 @@ class OutputTest(unittest.TestCase):
 
     def test_a_models_trades_are_its_best_picks_at_their_close(self):
         store, panel, news = load_data(config(self.root))
-        settings = Settings(min_price=0, min_dollar_volume=0, refresh_time="off")
+        settings = Settings(min_price=0, min_dollar_volume=0)
         model = small_models(picks=3, price=RandomPriceModel(1))
         t = 20
         result = score_day(panel.window(t, model.bars_lookback), news_window(news, news_cutoff(panel.sessions[t]), 7),

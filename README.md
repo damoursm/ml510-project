@@ -18,9 +18,10 @@ requirements.txt   Shared pinned course dependencies
 
 ## Recommendations API
 
-`src/stock_recommender` serves the stocks to buy and to sell at the next open, ranked by models run
-on the downloaded daily bars and news. The models are placeholders until trained ones are plugged into
-`stock_recommender/models.py` (`load_models`). Download the history once, then start the API:
+`src/stock_recommender` serves the stocks to buy and to sell at the next open, ranked by models run on the
+downloaded daily bars and news: the best combination of models from a backtest run (see *The served models*), or,
+until one is set, the placeholders of `stock_recommender/models.py` (`load_models`). Download the history once, then
+start the API:
 
 ```bash
 python scripts/download_daily_bars.py
@@ -33,30 +34,48 @@ Poll it at any time; `/docs` shows every parameter and the response schema:
 ```bash
 # The latest recommendations, from the data on disk.
 curl "http://127.0.0.1:8000/recommendations/latest?limit=20"
-# Fetch new data first (about 20 s), run the models, then email the lists.
-curl -X POST "http://127.0.0.1:8000/recommendations/latest?fetch=true&email=true&limit=20"
+# Fetch new data first (about 20 s), run the models, then email the lists to these addresses.
+curl -X POST "http://127.0.0.1:8000/recommendations/latest?fetch=true&email=you@example.com&limit=20"
 ```
 
-The response holds a `buy` list (best scores first) and a `sell` list (worst scores first), with the
-bars date (`as_of`), the news cutoff and the model version; a POST also reports how the fetch and the
-email went. The models see bars through the last trading day (`as_of`) and news published before its
-16:00 New York close. Fetching before the close therefore only catches up on completed days, so `as_of`
-advances once a day, after the close. The `as_of` bar and news fetched at 16:00 are a snapshot that a
-later fetch replaces with their final versions, so the lists for the same `as_of` can still change;
-`generated_at` shows when they were computed.
+The response holds a `buy` list (best scores first) and a `sell` list (worst scores first), with the bars date
+(`as_of`), the news cutoff and the model version. A POST also reports how the fetch and the email went.
 
-Every weekday at 16:00 New York time the API fetches the day's bars and news by itself, and at startup
-if it was not running then. Each fetch re-downloads the last 90 weekdays of bars, because Polygon adjusts
-bars for the splits it knows when they are downloaded; the download scripts also fetch again any day
-stored before it ended. Once email is set up (below), each of these runs also emails the top `RECOMMENDER_TOP_N` buys and sells,
-with a warning when the fetch failed and the lists come from older data; `RECOMMENDER_EMAIL_DAILY=false`
-turns that off. `/health` shows the next and last run, and how the last email went. Use a single worker process, or each one
-runs the downloads.
+**What the models see.** Bars through the last trading day (`as_of`), and news published before its 16:00 New York
+close. A fetch before the close only catches up on completed days, so `as_of` advances once a day, after the close.
 
-Settings are read from the environment or `.env` as `RECOMMENDER_<NAME>` (see
-`stock_recommender/config.py`), e.g. `RECOMMENDER_REFRESH_TIME=off` to stop the daily fetch. To send
-email, e.g. through Gmail with an [app password](https://support.google.com/accounts/answer/185833),
-add to `.env`:
+**Snapshots.** The `as_of` bar and news fetched at 16:00 are a snapshot that a later fetch replaces with their final
+versions, so the lists for the same `as_of` can still change; `generated_at` shows when they were computed.
+
+**Fetching.** Each fetch re-downloads the last 90 weekdays of bars, because Polygon adjusts bars for the splits it
+knows when they are downloaded; the download scripts also fetch again any day stored before it ended. The API does
+nothing on its own: the email task below fetches and emails every weekday. `/health` shows the last fetch. Use a
+single worker process: two would download into the same files at once.
+
+### The served models
+
+With `RECOMMENDER_MODEL_RUN` naming a backtest run, the API serves that run's final selection in place of
+`load_models()`. That selection is the best combination of models and hyperparameters, chosen on 2022-2025 and fit on
+2021-2025 (`selection.json` and `model/<name>.pkl`). Pin it in `.env`, then restart the API task:
+
+```bash
+RECOMMENDER_MODEL_RUN=artifacts/cv/20261113T174213Z-8f850acf
+```
+
+When a backtest finds a better combination, point this line at its run and restart the task. A pinned run never
+changes by itself.
+- **Ranking.** Each selected model ranks the stocks from the newest files through the backtest's decision path
+  (`score_day`). It uses the pickle the run saved (never refit), and the run's price and dollar-volume filters and news
+  inputs.
+- **Lists.** They hold each model's top `limit` buys and worst `limit` sells. Each item carries its `model`, `run`
+  names the run, and `model_version` joins the models' versions.
+- **Health.** `/health` shows whether each model loaded. If none loads, the API answers 503 and the error goes to
+  `logs/api.log`.
+
+### Settings, email and the scheduled tasks
+
+Settings are read from the environment or `.env` as `RECOMMENDER_<NAME>` (see `stock_recommender/config.py`). To send
+email, e.g. through Gmail with an [app password](https://support.google.com/accounts/answer/185833), add to `.env`:
 
 ```bash
 RECOMMENDER_SMTP_HOST=smtp.gmail.com
@@ -65,22 +84,74 @@ RECOMMENDER_SMTP_PASSWORD=your-app-password
 RECOMMENDER_EMAIL_TO=you@gmail.com,teammate@example.com
 ```
 
-The API has no authentication: keep it on 127.0.0.1 (uvicorn's default), since anyone who can reach it
-can trigger fetches and emails.
+The API sends through that server to the addresses each request gives (`email=`), and `RECOMMENDER_EMAIL_TO` is where
+the email task asks it to send. The API has no authentication: keep it on 127.0.0.1 (uvicorn's default), since anyone
+who can reach it can trigger fetches and emails.
 
-To keep the API running on Windows without starting it by hand, register a scheduled task once:
+On Windows, two scheduled tasks run all of this without starting anything by hand:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install_task.ps1   # -Uninstall removes it
+powershell -ExecutionPolicy Bypass -File scripts/install_task.ps1         # the API; -Uninstall removes it
+powershell -ExecutionPolicy Bypass -File scripts/install_email_task.ps1   # the 16:00 email; -Uninstall removes it
 ```
 
-The task runs `scripts/serve.py`, without a window, when you log on and again at 15:55 New York time on
-weekdays in case the API stopped; it exits at once if an API already listens on port 8000, e.g. one started
-by hand. The API logs to `logs/api.log`. It runs the code checked out in this folder, so restart it after
-pulling or switching branches (`Stop-ScheduledTask` then `Start-ScheduledTask` with
-`-TaskName "ML510 stock recommender"`). It runs only while you are logged on and the computer is awake: one
-asleep at 16:00 fetches and emails when it wakes. `-Python` picks another interpreter than Miniconda's
-`pythonw.exe`.
+- **"ML510 stock recommender"** runs `scripts/serve.py` without a window.
+  - It starts when you log on, and again at 15:55 New York time on weekdays in case the API stopped. It exits at once
+    if an API already listens on port 8000, e.g. one started by hand.
+  - The API logs to `logs/api.log`.
+  - It runs the code checked out in this folder and reads `.env` once, at startup. Restart it after pulling or
+    switching branches, or after changing `.env`: `Stop-ScheduledTask` then `Start-ScheduledTask`, with
+    `-TaskName "ML510 stock recommender"`.
+- **"ML510 recommendations email"** runs `scripts/email_recommendations.py` every weekday at 16:00 New York time.
+  - It calls `POST /recommendations/latest?fetch=true&email=<RECOMMENDER_EMAIL_TO>`, so the API fetches the day's bars
+    and news, ranks, and emails the lists.
+  - The email carries a warning when the fetch failed and the lists come from older data.
+  - If the computer is asleep or off at 16:00, it runs when the computer is available again.
+  - It logs to `logs/email.log`.
+
+Both tasks run only while you are logged on. `-Python` picks another interpreter than Miniconda's `pythonw.exe`.
+`python scripts/preview_email.py` shows the email from the files on disk without sending it.
+
+## Dashboard
+
+`stock_recommender/dashboard.py` writes a page that explains the recommendations, again at every call of the API: every
+GET or POST of `/recommendations/latest`, by hand or by the 16:00 email task. Open
+http://127.0.0.1:8000/dashboard (it refreshes every minute), or `data/processed/dashboard/index.html` directly. It has
+two tabs; `/dashboard#backtest` opens the second, and the minute's refresh keeps the tab you chose.
+
+The **Recommendations** tab:
+- **The lists.** Each served model's buy and sell lists. Beside each stock: its value of the features its model's
+  ranking follows most, with its percentile among the tradable stocks.
+- **SHAP and LIME values.** Hover over a stock, or Tab to it, to see how much each feature moves it up or down the
+  ranking, in points of rank percentile (100 is the best stock, and the average stock sits at 50).
+  - The models rank from raw bars and news, not from a row of features, so both methods explain a surrogate: a
+    gradient-boosted tree that predicts each scored stock's rank percentile from the 18 features and its dollar volume
+    (the tie-break between equal scores). Its R² on the stocks held out of its fit, shown under each model, says how
+    much the values tell about the model itself.
+  - SHAP values are a permutation estimate. Walks start from 100 stocks spread along the ranking and switch the
+    features to the stock's values one at a time, in a random order and its reverse. The values add up to the stock's
+    predicted percentile minus the average stock's.
+  - LIME fits a weighted ridge regression to 5,000 perturbations that keep each feature at the stock's value or take
+    another stock's. LIME's kernel weighs them by how close they stay to the stock, so its values describe nearby
+    changes and run smaller than SHAP's, which compare with the average stock.
+  - `explain.py` computes both, without the shap or lime packages.
+- **What drives each model's ranking.** For each of the ten price features (`features.py`) and the eight news features
+  (`news_features.py`), the Spearman correlation between the feature and the model's ranking, across the stocks it
+  scored (`explain.py`). This describes any model, a rule such as `most_liquid` as well as a fitted one. A price or news
+  part with a `feature_importances()` method returning `{feature: importance}` also shows the importances it measures.
+  The news features that read LLM scores stay n/a until the day's articles are scored.
+- **Calls.** The latest calls, with their result, fetch and email: a count, never the addresses.
+
+The **Backtest simulation** tab shows the served run's out-of-sample results, 2022-2025, from its tables. Each model,
+the account and the SPY references get their mean yearly return, Sharpe, drawdown, profitable periods, IC and spread,
+then their return each year and the cumulative profit. How the recommendations do in 2026 is never shown: 2026 is
+reserved for the one final evaluation.
+
+Explaining a new day's lists takes a few seconds and runs after the response, so it never delays a call. A failure is
+logged and shown on the page; it never fails the call, and a failed call keeps the last lists on the page.
+`RECOMMENDER_DASHBOARD_DIR` moves the folder (default `data/processed/dashboard`), and an empty value turns the
+dashboard off. The folder holds `index.html`, `latest.json` (the last lists, with their explanation) and `calls.jsonl`
+(one line per call).
 
 ## News sentiment from a local LLM
 
@@ -168,7 +239,7 @@ its digest (the exact weights) and the prompt version. Changing the prompt means
 scores become stale and everything is scored again, but the old rows stay in the files, as do other models' rows.
 
 `model_digests.json` in that directory records the weights the scores come from. If `qwen3:8b` is pulled again, every
-run refuses to start, the daily refresh included, until you restore the old weights or accept the new ones once with
+run refuses to start, the API's fetches included, until you restore the old weights or accept the new ones once with
 `python scripts/score_news.py --allow-new-digest --start <today> --end <today>`. Use a recent range, so no older
 article is scored with the new weights. A run also stops if the weights change while it runs.
 
@@ -179,9 +250,9 @@ python scripts/score_news.py --retry-minutes 10    # score 2021-2025: days of GP
 
 With `--retry-minutes`, a run left alone waits and goes on when Ollama restarts, instead of stopping.
 
-The daily refresh scores the new articles after downloading them (`RECOMMENDER_SCORE_NEWS=false` turns that off), so
-Ollama must be running at 16:00; if it is not, the refresh reports the error and those articles stay unscored until
-the next run. `RECOMMENDER_OLLAMA_URL`, `RECOMMENDER_OLLAMA_MODEL`, `RECOMMENDER_SENTIMENT_MAX_TICKERS` and
+Each of the API's fetches scores the new articles after downloading them (`RECOMMENDER_SCORE_NEWS=false` turns that
+off), so Ollama must be running at 16:00, when the email task fetches; if it is not, the fetch reports the error and
+those articles stay unscored until the next one. `RECOMMENDER_OLLAMA_URL`, `RECOMMENDER_OLLAMA_MODEL`, `RECOMMENDER_SENTIMENT_MAX_TICKERS` and
 `RECOMMENDER_SENTIMENT_WORKERS` change the server, the model, the ticker limit and the requests sent at once.
 
 `stock_recommender/news_features.py` turns the scores into eight features per stock and decision. They read the
@@ -275,9 +346,16 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
   - No choice for a year sees that year or a later one: `select()` raises `LeakageError` otherwise.
   - Only the targets (training labels, realized returns, metrics) look ahead.
 - **Models**: `--models` lists the models to backtest, by default every model in `backtest/registry.py`;
-  `--ensemble NAME=MODEL:W,MODEL:W` adds a model that blends others' rank-normalized scores. So far there is
-  one model, `most_liquid`: it expects no move for any stock, so it buys the 20 most liquid ones. It has no
-  hyperparameters, so nothing is tuned for it.
+  `--ensemble NAME=MODEL:W,MODEL:W` adds a model that blends others' rank-normalized scores. There are two models:
+  - `most_liquid` expects no move for any stock, so it buys the 20 most liquid ones. It has no hyperparameters, so
+    nothing is tuned for it.
+  - `random_forest` (`stock_recommender/forest.py`) is a random forest on the ten daily-bar features below, with no
+    news. It learns each stock's 5-session forward return minus the day's average over the tradable stocks,
+    clipped at the 1st and 99th percentiles, so it learns the order of the stocks rather than the market's move. It
+    trains on one decision day in every 5 sessions, so the holdings never overlap. It buys its 20 best predictions.
+    Its grid tunes the stocks a leaf averages at least (`min_samples_leaf`: 1,000 by default, or 250) and the share
+    of the features each split tries (`max_features`: 0.5 by default, or 1.0). Its own feature importances show on
+    the dashboard.
 
   To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`), then register a factory
   and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also
@@ -305,7 +383,8 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
     cost, its profit before and after costs, and its turnover (the dollars traded at its entry over the dollars
     invested); and every order it placed, with its return and how it exited.
   - `profit.csv` and `figures/profit.png`: each strategy's profit at every open, from $0, test years added up.
-  - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test.
+  - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test. This is what the API serves
+    once `RECOMMENDER_MODEL_RUN` names the run; a model that does not pickle cannot be served.
   - Also: `signals.csv`, `null.csv`, `anomalies.csv`, and `guards.json` (the files read, the last date of every
     input, the years behind each choice, and `final_evaluated: false`).
 

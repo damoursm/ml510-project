@@ -35,8 +35,8 @@ sys.path.insert(0, str(ROOT / "src"))
 import pandas as pd  # noqa: E402
 from stock_recommender.anonymize import Aliases  # noqa: E402
 from stock_recommender.config import Settings  # noqa: E402
-from stock_recommender.sentiment import (OllamaScorer, ScorerUnavailable, check_digest, pending,  # noqa: E402
-                                         score_day, tradable_days)
+from stock_recommender.sentiment import (NUM_CTX, OllamaScorer, ScorerUnavailable, check_digest,  # noqa: E402
+                                         pending, score_day, tradable_days)
 
 
 def news_days(directory: Path, start: date, end: date) -> list[tuple[date, Path]]:
@@ -95,6 +95,10 @@ def main() -> int:
     parser.add_argument("--max-tickers", type=int, default=settings.sentiment_max_tickers,
                         help="Articles tagged with more companies are not scored.")
     parser.add_argument("--workers", type=int, default=settings.sentiment_workers, help="Articles sent at once.")
+    parser.add_argument("--num-ctx", type=int, default=NUM_CTX,
+                        help="Tokens of context per request: the server's, or it reloads the model. Below "
+                             f"{NUM_CTX} (a server with more, smaller slots), an article whose prompt might not fit is "
+                             f"left unscored for a run at {NUM_CTX}.")
     parser.add_argument("--limit", type=int, help="Stop after about this many articles (a pilot run).")
     parser.add_argument("--retry-minutes", type=float, default=0,
                         help="When the server is unavailable, wait this long and go on, instead of stopping.")
@@ -111,6 +115,8 @@ def main() -> int:
         parser.error("Need --start <= --end and --max-tickers >= 1.")
     if args.retry_minutes < 0:
         parser.error("Need --retry-minutes >= 0.")
+    if args.num_ctx < 2048:
+        parser.error("Need --num-ctx >= 2048: the instructions alone take about 650 tokens.")
     if args.dry_run and args.allow_new_digest:
         parser.error("--allow-new-digest records Ollama's weights: it needs a real run, not --dry-run.")
 
@@ -143,7 +149,7 @@ def keep(args: argparse.Namespace, day: date):
 
 def score(args: argparse.Namespace, aliases: Aliases | None) -> int:
     """Score what the range holds to score, with a new scorer; return the exit code."""
-    scorer = OllamaScorer(args.url, args.model, aliases=aliases)
+    scorer = OllamaScorer(args.url, args.model, aliases=aliases, num_ctx=args.num_ctx)
     if args.allow_new_digest:  # Recorded even when the range has nothing to score: it unblocks later runs.
         try:
             scorer.check()

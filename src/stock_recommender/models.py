@@ -4,6 +4,8 @@ To plug in trained models, implement PriceModel and NewsModel (predict, and fit 
 them in Models, then return them from load_models() to serve them, and add a factory and its hyperparameter
 grid to backtest/registry.py to backtest them. A decision's output (recommend.score_day) holds the full
 ranking and `trades`, the model's recommended buys: its best `picks` stocks with their price.
+With RECOMMENDER_MODEL_RUN set, the API serves a backtest run's final selection instead, the models it pickled
+(served_models.py).
 """
 from dataclasses import dataclass
 from typing import Callable, Protocol

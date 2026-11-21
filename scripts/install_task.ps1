@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-Registers a Windows scheduled task that keeps the recommendations API running in the background, so its
-weekday 16:00 New York refresh fetches the data and emails the lists without starting the API by hand.
+Registers a Windows scheduled task that keeps the recommendations API running in the background, so that the
+16:00 email task (scripts/install_email_task.ps1) finds it without starting the API by hand.
 
 .DESCRIPTION
 The task runs scripts/serve.py with pythonw (no window) when you log on, and again at 15:55 New York time on

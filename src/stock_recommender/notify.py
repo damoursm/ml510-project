@@ -19,8 +19,12 @@ def cells(item: Recommendation) -> list[str]:
 
 def compose(body: RecommendationList, sender: str, recipients: list[str]) -> EmailMessage:
     """Return a message listing the buys and sells, as plain text and as HTML tables."""
+    # A served backtest run is named, and with several models each row says whose it is.
+    source = f" from backtest run {body.run}" if body.run else ""
+    several = len({item.model for item in body.buy + body.sell}) > 1
+    headers = HEADERS[:1] + ["Model"] + HEADERS[1:] if several else HEADERS
     intro = (f"Stocks to buy and sell at the next open, from bars through {body.as_of} and news published "
-             f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}, "
+             f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}{source}, "
              f"{body.horizon_days}-day horizon.")
     text, html = [intro], [f"<p>{escape(intro)}</p>"]
     if body.fetch and body.fetch.errors:  # The lists come from the older data still on disk.
@@ -28,11 +32,11 @@ def compose(body: RecommendationList, sender: str, recipients: list[str]) -> Ema
         text.append(warning)
         html.append(f"<p><b>{escape(warning)}</b></p>")
     for title, items in (("Buy", body.buy), ("Sell", body.sell)):
-        rows = [cells(item) for item in items]
-        widths = [max(map(len, column)) for column in zip(HEADERS, *rows)]
+        rows = [cells(item)[:1] + [item.model or ""] + cells(item)[1:] if several else cells(item) for item in items]
+        widths = [max(map(len, column)) for column in zip(headers, *rows)]
         text += ["", title.upper()] + ["  ".join(cell.rjust(width) for cell, width in zip(line, widths))
-                                       for line in [HEADERS, *rows]]
-        header = "".join(f"<th>{escape(cell)}</th>" for cell in HEADERS)
+                                       for line in [headers, *rows]]
+        header = "".join(f"<th>{escape(cell)}</th>" for cell in headers)
         lines = "".join("<tr>" + "".join(f'<td align="right">{escape(cell)}</td>' for cell in row) + "</tr>"
                         for row in rows)
         html.append(f'<h3>{title}</h3><table cellpadding="4"><tr>{header}</tr>{lines}</table>')
@@ -47,13 +51,14 @@ def compose(body: RecommendationList, sender: str, recipients: list[str]) -> Ema
     return message
 
 
-def send(body: RecommendationList, settings: Settings) -> EmailReport:
-    """Email the recommendations to settings.email_to; a failure is reported, not raised."""
-    recipients = [address.strip() for address in settings.email_to.split(",") if address.strip()]
+def send(body: RecommendationList, settings: Settings, recipients: list[str]) -> EmailReport:
+    """Email the recommendations to the recipients; a failure is reported, not raised."""
     sender = settings.email_from or settings.smtp_user
-    if not (settings.smtp_host and recipients and sender):
-        return EmailReport(sent_to=[], error="Email is not configured: set RECOMMENDER_SMTP_HOST, "
-                                             "RECOMMENDER_EMAIL_TO and RECOMMENDER_SMTP_USER or _EMAIL_FROM.")
+    if not (settings.smtp_host and sender):
+        return EmailReport(sent_to=[], error="Email is not configured: set RECOMMENDER_SMTP_HOST and "
+                                             "RECOMMENDER_SMTP_USER or _EMAIL_FROM.")
+    if not recipients:
+        return EmailReport(sent_to=[], error="No address to send the lists to.")
     context = ssl.create_default_context()  # Verifies the server's certificate.
     try:
         message = compose(body, sender, recipients)

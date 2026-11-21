@@ -147,6 +147,9 @@ class WindowGuardTest(Store):
         # The API's file readers and load_models() skip the window's guards, and trained models would leak.
         forbidden_imports = {"read_bars", "read_news", "recent_day_files", "load_models"}
         forbidden_modules = {"requests", "httpx", "urllib", "duckdb", "socket"}
+        # The models the API serves were fit on the test years; nothing here may reach them, by any import form:
+        # from ..served_models import x, stock_recommender.served_models, from .. import served_models.
+        served_modules = {"served_models"}
         for path in BACKTEST.glob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -155,6 +158,8 @@ class WindowGuardTest(Store):
                     modules = names | ({node.module} if isinstance(node, ast.ImportFrom) and node.module else set())
                     self.assertFalse(forbidden_modules & {name.split(".")[0] for name in modules}, path.name)
                     self.assertFalse(forbidden_imports & names, f"{path.name}:{node.lineno}")
+                    parts = {part for name in modules for part in name.split(".")}
+                    self.assertFalse(served_modules & parts, f"{path.name}:{node.lineno}")
                 if isinstance(node, ast.Call):
                     name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
                     self.assertNotIn(name, anywhere, f"{path.name}:{node.lineno}")
@@ -355,7 +360,7 @@ class EngineTest(Store):
 
     def test_the_backtest_ranks_exactly_as_the_api(self):
         store, panel, news = load_data(config(self.root))
-        settings = Settings(min_price=0, min_dollar_volume=0, refresh_time="off")
+        settings = Settings(min_price=0, min_dollar_volume=0)
         models = small_models(price=FixedPriceModel({f"T{i:03d}": (i % 7) / 100 for i in range(self.tickers)}))
         t = 25
         backtest = score_day(panel.window(t, models.bars_lookback), news_window(news, news_cutoff(panel.sessions[t]), 7),

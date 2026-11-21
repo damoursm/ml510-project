@@ -83,6 +83,12 @@ MAX_SUMMARY_CHARS = 12_000  # Longer summaries are cut, so every prompt fits NUM
 MAX_TITLE_CHARS = 1_000
 MAX_ANSWER_TOKENS = 512  # The answer for 5 tickers takes about 200 tokens; a runaway answer is cut, then asked again.
 RETRY_TEMPERATURE = 0.5  # A retry samples, with its own seed, so it does not repeat the same malformed answer.
+# A scorer may use a smaller context than NUM_CTX, on a server run with more, smaller slots for a backfill. It then
+# sends an article only if its prompt surely fits with room for the answer: at most MIN_CHARS_PER_TOKEN characters a
+# token (prose has about 4, but Qwen writes each digit as a token) and TEMPLATE_TOKENS for the chat template. The
+# other articles stay unscored until a run at NUM_CTX.
+MIN_CHARS_PER_TOKEN = 2.0
+TEMPLATE_TOKENS = 32
 
 
 class ScorerUnavailable(RuntimeError):
@@ -191,8 +197,10 @@ class OllamaScorer:
     """
 
     def __init__(self, url: str = "http://localhost:11434", model: str = "qwen3:8b", timeout: float = 300,
-                 attempts: int = 3, session: requests.Session | None = None, aliases: Aliases | None = None):
+                 attempts: int = 3, session: requests.Session | None = None, aliases: Aliases | None = None,
+                 num_ctx: int = NUM_CTX):
         self.url, self.model, self.timeout, self.attempts = url.rstrip("/"), model, timeout, attempts
+        self.num_ctx = num_ctx  # Must match the server's context, or it reloads the model.
         self.session = session or requests.Session()
         self.aliases = aliases or Aliases()
         self.digest: str | None = None
@@ -232,7 +240,7 @@ class OllamaScorer:
     def body(self, title: str | None, description: str | None, companies, retry: int = 0) -> dict:
         """The request for a masked article and its placeholders; retry counts the answers already found malformed
         or partial, which a resample replaces."""
-        options = {"temperature": 0, "seed": 0, "num_ctx": NUM_CTX, "num_predict": MAX_ANSWER_TOKENS}
+        options = {"temperature": 0, "seed": 0, "num_ctx": self.num_ctx, "num_predict": MAX_ANSWER_TOKENS}
         if retry:
             options.update(temperature=RETRY_TEMPERATURE, seed=self.retry_seed + retry)
         # No keep_alive: the server's own setting keeps the model loaded for the other programs that use it.
@@ -259,10 +267,19 @@ class OllamaScorer:
                                           self.aliases, published, others(tags))
         wanted = tickers if wanted is None else [ticker for ticker in tickers if ticker in set(wanted)]
         asked = {ticker: company for ticker, company in zip(tickers, labels) if ticker in wanted}
-        if not asked:
-            return {}
-        found = self._ask(title, description, list(dict.fromkeys(asked.values())))
+        companies = list(dict.fromkeys(asked.values()))
+        if not asked or not self.fits(title, description, companies):
+            return {}  # An article too long for a reduced context is asked by a later run at NUM_CTX.
+        found = self._ask(title, description, companies)
         return {ticker: found[company] for ticker, company in asked.items() if company in found}
+
+    def fits(self, title: str, description: str, companies) -> bool:
+        """Whether a masked article's prompt surely fits the context with room for the answer. At NUM_CTX every
+        prompt does: MAX_TITLE_CHARS and MAX_SUMMARY_CHARS cut the article to fit."""
+        if self.num_ctx >= NUM_CTX:
+            return True
+        characters = len(SYSTEM_PROMPT) + len(user_prompt(title, description, companies))
+        return characters / MIN_CHARS_PER_TOKEN + TEMPLATE_TOKENS + MAX_ANSWER_TOKENS <= self.num_ctx
 
     def _ask(self, title: str, description: str, tickers: list[str]) -> dict[str, dict]:
         """Return the scores the LLM gives a masked article's placeholders, by placeholder."""

@@ -13,6 +13,7 @@ from stock_recommender.api import create_app
 from stock_recommender.config import ROOT, Settings
 from stock_recommender.models import load_models
 from stock_recommender.recommend import news_counts
+from .test_served_models import make_run
 
 
 def write_bars(directory: Path, day: str, rows: dict[str, tuple[float, float]]):
@@ -55,7 +56,7 @@ class RecommendationsApiTest(unittest.TestCase):
         root = Path(self.directory.name)
         self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", sentiment_dir=root / "sentiment",
                                  top_n=10, min_price=5.0,
-                                 min_dollar_volume=1_000.0, refresh_time="")
+                                 min_dollar_volume=1_000.0)
         # BIG trades more dollars than ACME but sorts after it; PENNY is too cheap; THIN too illiquid;
         # GONE stopped trading; ZVZZT is an exchange test symbol.
         for day in ("2026-10-14", "2026-10-15"):
@@ -176,6 +177,68 @@ class NewsCountsTest(unittest.TestCase):
         news = pd.DataFrame({"tickers": [["AAA", "AAA", "BBB"], None, ["AAA"], []]})
         self.assertEqual(news_counts(news).to_dict(), {"AAA": 2, "BBB": 1})
         self.assertEqual(len(news_counts(news.iloc[:0])), 0)
+
+
+class ModelRunTest(unittest.TestCase):
+    """With a backtest run set, the lists come from its final selection, the best combination of models: each
+    selected model's best and worst stocks from the newest files, on every day the data is there."""
+    setUp, tearDown = RecommendationsApiTest.setUp, RecommendationsApiTest.tearDown
+
+    def client(self, models: dict, **fields) -> TestClient:
+        self.run_folder = make_run(Path(self.directory.name), models,
+                                   **({"min_price": 5.0, "min_dollar_volume": 1_000.0} | fields))
+        return TestClient(create_app(replace(self.settings, model_run=str(self.run_folder))))
+
+    @staticmethod
+    def fixed(returns: dict, **changes):
+        return replace(load_models(), price=FixedPriceModel(returns), **({"version": "fixed"} | changes))
+
+    def test_the_lists_come_from_the_runs_model(self):
+        client = self.client({"fixed": self.fixed({"ACME": 0.03, "BIG": 0.01})})
+        body = client.get("/recommendations/latest", params={"limit": 1}).json()
+        self.assertEqual([(item["ticker"], item["model"]) for item in body["buy"]], [("ACME", "fixed")])
+        self.assertEqual([(item["ticker"], item["model"]) for item in body["sell"]], [("BIG", "fixed")])
+        self.assertEqual((body["model_version"], body["horizon_days"], body["as_of"], body["universe_size"]),
+                         ("fixed", 5, "2026-10-16", 2))
+        self.assertEqual(body["run"], self.run_folder.resolve().as_posix())
+        served = client.get("/health").json()["run"]
+        self.assertEqual((served["run"], served["models"], served["error"]), (body["run"], {"fixed": "loaded"}, None))
+
+    def test_each_selected_model_gives_its_own_lists(self):
+        client = self.client({"fixed": self.fixed({"ACME": 0.03, "BIG": 0.01}),
+                              "liquid": replace(load_models(), version="liquid", horizon_days=3)})
+        body = client.get("/recommendations/latest", params={"limit": 1}).json()
+        # The placeholders rank the larger dollar volume first: BIG.
+        self.assertEqual([(item["model"], item["ticker"]) for item in body["buy"]],
+                         [("fixed", "ACME"), ("liquid", "BIG")])
+        self.assertEqual([(item["model"], item["ticker"]) for item in body["sell"]],
+                         [("fixed", "BIG"), ("liquid", "ACME")])
+        self.assertEqual((body["model_version"], body["horizon_days"]), ("fixed + liquid", 5))
+
+    def test_the_runs_filters_apply(self):
+        client = self.client({"liquid": load_models()}, min_dollar_volume=50_000.0)
+        body = client.get("/recommendations/latest").json()
+        self.assertEqual([item["ticker"] for item in body["buy"]], ["BIG"])  # ACME trades $5,000 a day.
+        self.assertEqual((body["sell"], body["universe_size"]), ([], 1))
+
+    def test_a_run_that_does_not_load_is_unavailable_and_named_in_health(self):
+        client = TestClient(create_app(replace(self.settings, model_run="artifacts/none/missing")))
+        with self.assertLogs("uvicorn.error", "ERROR"):
+            response = client.get("/recommendations/latest")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("No model of the served run loaded", response.json()["detail"])
+        self.assertIn("not a backtest run", client.get("/health").json()["run"]["error"])
+
+    def test_building_the_app_loads_nothing(self):
+        with unittest.mock.patch("stock_recommender.api.load_selection", side_effect=AssertionError("loaded")):
+            create_app(replace(self.settings, model_run="artifacts/t/anything"))  # As the module-level app.
+
+    def test_without_a_run_the_lists_are_load_models(self):
+        client = TestClient(create_app(self.settings, load_models()))
+        body = client.get("/recommendations/latest").json()
+        self.assertIsNone(body["run"])
+        self.assertTrue(all(item["model"] is None for item in body["buy"] + body["sell"]))
+        self.assertNotIn("run", client.get("/health").json())
 
 
 if __name__ == "__main__":

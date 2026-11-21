@@ -9,7 +9,10 @@ from unittest import mock
 from stock_recommender.api import create_app
 from stock_recommender.config import Settings
 from stock_recommender.models import load_models
+from .test_served_models import make_run
 from .test_stock_recommender import FixedPriceModel, TestClient, write_bars
+
+TO = "me@example.com, team@example.com"  # What the 16:00 email task passes as email=.
 
 
 class FakeSMTP:
@@ -48,8 +51,8 @@ class EmailTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
         self.settings = Settings(bars_dir=root / "bars", news_dir=root / "news", sentiment_dir=root / "sentiment",
-                                 min_dollar_volume=0.0, refresh_time="off", smtp_host="smtp.example.com", smtp_user="bot@example.com",
-                                 smtp_password="secret", email_to="me@example.com, team@example.com")
+                                 min_dollar_volume=0.0, smtp_host="smtp.example.com", smtp_user="bot@example.com",
+                                 smtp_password="secret", score_news=False)
         write_bars(self.settings.bars_dir, "2026-10-16", {"BIG": (100, 1_000), "DUD": (30, 500)})
         FakeSMTP.sent, FakeSMTP.calls, FakeSMTP.tls = [], [], True
 
@@ -63,7 +66,7 @@ class EmailTest(unittest.TestCase):
             return client.post("/recommendations/latest", params={"limit": 1, **params}).json()
 
     def test_email_lists_the_buys_and_sells(self):
-        body = self.post(email=True)
+        body = self.post(email=TO)
         self.assertEqual(body["email"], {"sent_to": ["me@example.com", "team@example.com"], "error": None})
         self.assertEqual(FakeSMTP.calls, ["connect smtp.example.com:587", "starttls", "login bot@example.com"])
         (message,) = FakeSMTP.sent
@@ -80,8 +83,21 @@ class EmailTest(unittest.TestCase):
         self.assertIsNone(self.post()["email"])
         self.assertEqual(FakeSMTP.sent, [])
 
+    def test_email_takes_the_recipients_addresses(self):
+        downloads = []
+
+        def run(command, **kwargs):
+            downloads.append(command)
+            return subprocess.CompletedProcess(command, 0, "done", "")
+
+        for email in ("true", " , ", "me@example.com\nBcc: everyone@example.com", "Me <me@example.com>"):
+            with mock.patch("stock_recommender.refresh.subprocess.run", run):
+                body = self.post(fetch=True, email=email)
+            self.assertIn("email takes the addresses", body["detail"], email)
+        self.assertEqual((downloads, FakeSMTP.sent), ([], []))  # Refused before fetching anything.
+
     def test_unconfigured_email_is_reported(self):
-        body = self.post(replace(self.settings, smtp_host=""), email=True)
+        body = self.post(replace(self.settings, smtp_host=""), email=TO)
         self.assertEqual(body["email"]["sent_to"], [])
         self.assertIn("RECOMMENDER_SMTP_HOST", body["email"]["error"])
         self.assertEqual([row["ticker"] for row in body["buy"]], ["BIG"])  # The lists are still returned.
@@ -89,7 +105,7 @@ class EmailTest(unittest.TestCase):
     def test_password_is_never_sent_unencrypted(self):
         FakeSMTP.tls = False
         with self.assertLogs("uvicorn.error", "ERROR"):
-            body = self.post(email=True)
+            body = self.post(email=TO)
         self.assertIn("refusing to send the password unencrypted", body["email"]["error"])
         self.assertEqual(FakeSMTP.sent, [])
 
@@ -100,7 +116,7 @@ class EmailTest(unittest.TestCase):
         models = replace(load_models(), price=FixedPriceModel({"BIG": 0.02, "DUD": -0.04}))
         client = TestClient(create_app(self.settings, models))
         with mock.patch("stock_recommender.notify.smtplib.SMTP", refuse), self.assertLogs("uvicorn.error", "ERROR"):
-            body = client.post("/recommendations/latest", params={"email": True}).json()
+            body = client.post("/recommendations/latest", params={"email": TO}).json()
         self.assertEqual(body["email"]["sent_to"], [])
         self.assertIn("SMTPConnectError", body["email"]["error"])
 
@@ -108,54 +124,75 @@ class EmailTest(unittest.TestCase):
         def login(smtp, user, password):
             password.encode("ascii")  # As smtplib does.
 
-        settings = replace(self.settings, smtp_password="motdepass\u00e9")
+        settings = replace(self.settings, smtp_password="motdepassé")
         with mock.patch.object(FakeSMTP, "login", login), self.assertLogs("uvicorn.error", "ERROR"):
-            body = self.post(settings, email=True)
+            body = self.post(settings, email=TO)
         self.assertIn("invalid email settings", body["email"]["error"])
         self.assertNotIn("motdepass", body["email"]["error"])
         self.assertEqual([row["ticker"] for row in body["buy"]], ["BIG"])
-        with self.assertLogs("uvicorn.error", "ERROR"):
-            body = self.post(replace(self.settings, email_to="me@example.com\nBcc: everyone@example.com"), email=True)
-        self.assertIn("invalid email settings", body["email"]["error"])
         self.assertEqual(FakeSMTP.sent, [])
 
-    def scheduled_email(self, settings, errors=False):
-        models = replace(load_models(), price=FixedPriceModel({"BIG": 0.02, "DUD": -0.04}))
-        def run(command, **kwargs):  # Each download succeeds, or fails with exit 1 when errors are given.
-            return subprocess.CompletedProcess(command, 1 if errors else 0, "", "no key" if errors else "done")
+    def test_the_email_warns_of_a_failed_fetch(self):
+        def run(command, **kwargs):  # Each download fails, as without a Polygon key.
+            return subprocess.CompletedProcess(command, 1, "", "no key")
 
-        with (mock.patch("stock_recommender.refresh.subprocess.run", run),
-              mock.patch("stock_recommender.notify.smtplib.SMTP", FakeSMTP)):
-            app = create_app(replace(settings, top_n=1), models)
-            with TestClient(app):
-                refresh = app.state.refresh
-                refresh._run_logged()  # What the schedule calls at refresh_time.
-        return refresh
-
-    def test_scheduled_refresh_emails_the_lists(self):
-        refresh = self.scheduled_email(self.settings)
-        self.assertEqual(len(FakeSMTP.sent), 1)
-        self.assertIn("BIG", FakeSMTP.sent[0].get_body(("plain",)).get_content())
-        self.assertNotIn("Warning", FakeSMTP.sent[0].get_body(("plain",)).get_content())
-        self.assertEqual(refresh.status()["last_run"]["after"]["sent_to"], ["me@example.com", "team@example.com"])
-
-    def test_scheduled_email_warns_of_a_failed_fetch(self):
-        with self.assertLogs("uvicorn.error", "ERROR"):
-            self.scheduled_email(self.settings, errors=True)
+        with mock.patch("stock_recommender.refresh.subprocess.run", run), self.assertLogs("uvicorn.error", "ERROR"):
+            body = self.post(fetch=True, email=TO)
+        self.assertEqual(len(body["fetch"]["errors"]), 2)
+        self.assertEqual(body["email"]["sent_to"], ["me@example.com", "team@example.com"])
         self.assertIn("Warning: fetching new data failed", FakeSMTP.sent[0].get_body(("plain",)).get_content())
-
-    def test_scheduled_email_is_skipped_when_off_or_unconfigured(self):
-        for settings in (replace(self.settings, email_daily=False), replace(self.settings, smtp_host="", email_to="")):
-            self.scheduled_email(settings)
-        self.assertEqual(FakeSMTP.sent, [])
-
-    def test_email_daily_reads_false_from_the_environment(self):
-        for raw, expected in (("false", False), ("0", False), ("true", True)):
-            with mock.patch.dict("os.environ", {"RECOMMENDER_EMAIL_DAILY": raw}):
-                self.assertIs(Settings.from_env().email_daily, expected)
 
     def test_password_is_kept_out_of_the_settings_repr(self):
         self.assertNotIn("secret", repr(self.settings))
+
+
+class RunEmailTest(unittest.TestCase):
+    """With a backtest run set, the email still sends the lists the API returns, now its selection's."""
+    setUp, tearDown = EmailTest.setUp, EmailTest.tearDown
+
+    def app(self, **models):
+        folder = make_run(Path(self.directory.name), models)
+        return create_app(replace(self.settings, model_run=str(folder), top_n=1))
+
+    @staticmethod
+    def fixed(returns: dict, version: str):
+        return replace(load_models(), price=FixedPriceModel(returns), version=version)
+
+    def test_the_email_sends_the_runs_lists(self):
+        app = self.app(fixed=self.fixed({"BIG": 0.02, "DUD": -0.04}, "fixed"))
+
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, "", "done")
+
+        with (mock.patch("stock_recommender.refresh.subprocess.run", run),
+              mock.patch("stock_recommender.notify.smtplib.SMTP", FakeSMTP)):
+            with TestClient(app) as client:  # As the 16:00 email task calls it.
+                sent = client.post("/recommendations/latest", params={"fetch": True, "email": TO}).json()
+                body = client.get("/recommendations/latest", params={"limit": 1}).json()
+        (message,) = FakeSMTP.sent
+        text = message.get_body(("plain",)).get_content()
+        self.assertEqual((sent["buy"], sent["sell"]), (body["buy"], body["sell"]))
+        self.assertEqual(message["Subject"], "Stock recommendations as of 2026-10-16: 1 buy, 1 sell")
+        self.assertIn(f"Model fixed from backtest run {body['run']}, 5-day horizon.", text)
+        self.assertEqual(([item["ticker"] for item in body["buy"]], [item["ticker"] for item in body["sell"]]),
+                         (["BIG"], ["DUD"]))
+        bought, sold = text.split("\nSELL\n")
+        self.assertIn("BIG", bought.split("\nBUY\n")[1])
+        self.assertIn("DUD", sold)
+        self.assertNotIn("<th>Model</th>", message.get_body(("html",)).get_content())  # One model: the usual columns.
+
+    def test_several_models_add_a_model_column(self):
+        app = self.app(fixed=self.fixed({"BIG": 0.02, "DUD": -0.04}, "fixed"),
+                       flipped=self.fixed({"BIG": -0.01, "DUD": 0.01}, "flipped"))
+        with mock.patch("stock_recommender.notify.smtplib.SMTP", FakeSMTP):
+            body = TestClient(app).post("/recommendations/latest", params={"limit": 1, "email": TO}).json()
+        self.assertEqual(body["email"]["sent_to"], ["me@example.com", "team@example.com"])
+        text = FakeSMTP.sent[0].get_body(("plain",)).get_content()
+        rows = [line.split()[:3] for line in text.splitlines()]
+        self.assertIn(["#", "Model", "Ticker"], rows)
+        self.assertIn(["1", "fixed", "BIG"], rows)
+        self.assertIn(["1", "flipped", "DUD"], rows)
+        self.assertIn("<th>Model</th>", FakeSMTP.sent[0].get_body(("html",)).get_content())
 
 
 if __name__ == "__main__":
