@@ -1,0 +1,814 @@
+"""The dashboard: a page that explains the API's recommendations, written again at every call. It has two tabs: the
+recommendations (the lists, what drives each model's ranking, the calls) and the backtest simulation of the served run.
+Hovering a listed stock shows its SHAP and LIME values (explain.py), from data the page carries as JSON.
+
+Every GET or POST of /recommendations/latest, by hand or by the 16:00 email task, is recorded (Dashboard.record): the
+lists it returned, how the fetch and the email went (counts, never the addresses), and the explanation of the lists
+(explain.py): what each model's ranking follows, and where the listed stocks stand on those features. A call that
+fails is recorded with its error, and the page keeps the last lists. The page also shows the served backtest run's
+out-of-sample results, 2022-2025, from the run's tables. It never shows how the recommendations did in 2026: that year
+is reserved for the one final evaluation.
+
+The files, in settings.dashboard_dir: index.html, the page (served at /dashboard, and readable without the API);
+latest.json, the last call that returned lists, with their explanation; calls.jsonl, one line per call.
+"""
+from datetime import datetime, timezone
+from html import escape
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import threading
+import time
+import pandas as pd
+from .config import ROOT, Settings
+from .explain import DESCRIPTIONS, OUTPUTS, explain, local_explanations
+from .schemas import RecommendationList
+from .served_models import TEST_YEAR
+
+log = logging.getLogger("uvicorn.error")
+HISTORY = 30  # Calls the page lists.
+PROFILE = 5  # A model's strongest drivers shown beside each listed stock.
+SHOWN = 6  # Hovering a stock shows its strongest features by SHAP and by LIME, this many of each.
+PROFIT_POINTS = 260  # Most points per line of the profit chart.
+STRATEGIES = {"account": "Account (every model's picks)", "spy_hold": "SPY, held",
+              "spy_mirror": "SPY, bought with each order", "universe_ew": "All tradable stocks, equal weight"}
+METRICS = {  # metrics.csv column: (label, format, explanation).
+    "mean_yearly_return": ("Mean yearly return", "signed", "Profit over the capital tied up, averaged over the years"),
+    "sharpe": ("Sharpe", "ratio", "Mean daily return over its standard deviation, annualized"),
+    "max_drawdown": ("Max drawdown", "signed", "Largest fall from a peak of the account's value"),
+    "period_hit_rate": ("Profitable periods", "share", "Share of holding periods that made money"),
+    "ic_mean": ("IC", "ic", "Mean rank correlation of the scores with the returns that followed"),
+    "spread_mean": ("Top-bottom spread", "signed", "Mean return of the best-ranked stocks minus the worst"),
+    "excess_return_vs_spy_hold": ("vs SPY held", "signed", "Mean yearly return minus SPY's, held"),
+    "null_return_percentile": ("Beats random picks", "share", "Share of random lists of the same size it beats"),
+}
+COLORS = ["#2f81f7", "#e8912d", "#a371f7", "#3fb950", "#db61a2", "#8b949e", "#2bb6b0", "#d29922"]
+CSS = """
+:root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --card: #f6f8fa; --pos: #1a7f37;
+        --neg: #cf222e; --accent: #0969da; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #3d444d; --card: #151b23; --pos: #3fb950;
+          --neg: #f85149; --accent: #4493f8; } }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+h3 { font-size: 14px; margin: 18px 0 6px; }
+.meta, .note, .pct, .muted { color: var(--muted); }
+.note { font-size: 13px; max-width: 900px; }
+.pct { font-size: 11px; margin-left: 4px; }
+.banner { margin: 12px 0; padding: 8px 12px; border-radius: 6px; background: var(--card);
+          border-left: 4px solid var(--accent); }
+.banner.bad { border-left-color: var(--neg); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; margin: 6px 0 14px; font-variant-numeric: tabular-nums; }
+th, td { padding: 4px 7px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th:first-child, td:first-child, .text { text-align: left; }
+th { color: var(--muted); font-weight: 600; vertical-align: bottom; }
+.pos { color: var(--pos); } .neg { color: var(--neg); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 4px 28px; }
+svg text { fill: var(--fg); font-size: 11px; } svg .muted { fill: var(--muted); }
+svg .axis { stroke: var(--line); } svg .up { fill: var(--pos); } svg .down { fill: var(--neg); }
+.tabs { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
+.tabs button { margin-bottom: -1px; padding: 8px 16px; border: 1px solid transparent; border-bottom: none;
+               border-radius: 6px 6px 0 0; background: none; color: var(--muted); font: inherit; font-weight: 600;
+               cursor: pointer; }
+.tabs button:hover { color: var(--fg); }
+.tabs button[aria-selected="true"] { color: var(--fg); background: var(--bg); border-color: var(--line); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.panel > section:first-child > h2 { margin-top: 20px; }
+tr[data-ticker] { cursor: help; }
+tr[data-ticker]:hover, tr[data-ticker]:focus { background: var(--card); outline: none; }
+.tip { position: fixed; z-index: 10; max-width: 660px; padding: 10px 12px; border: 1px solid var(--line);
+       border-radius: 8px; background: var(--bg); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22); font-size: 12px; }
+.tip table { margin: 6px 0 4px; }
+.tip th, .tip td { padding: 2px 6px; }
+.bar { position: relative; display: inline-block; width: 96px; height: 10px; vertical-align: middle;
+       background: linear-gradient(var(--line), var(--line)) center / 1px 100% no-repeat; }
+.bar i { position: absolute; top: 1px; bottom: 1px; border-radius: 2px; }
+.bar i.up { background: var(--pos); } .bar i.down { background: var(--neg); }
+"""
+# The tabs: (name, label). A tab's name is its address (#backtest), so a reload keeps it; no element has it as id,
+# so choosing a tab never scrolls the page.
+TABS = (("recommendations", "Recommendations"), ("backtest", "Backtest simulation"))
+SCRIPT = """<script>
+(function () {
+  var tabs = document.querySelectorAll("[data-tab]");
+  var tip = document.getElementById("tip");
+  function show(name) {
+    if (!document.getElementById("panel-" + name)) { name = tabs[0].getAttribute("data-tab"); }
+    tabs.forEach(function (tab) {
+      var mine = tab.getAttribute("data-tab") === name;
+      tab.setAttribute("aria-selected", mine ? "true" : "false");
+      document.getElementById("panel-" + tab.getAttribute("data-tab")).hidden = !mine;
+    });
+    tip.hidden = true;
+  }
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      var name = tab.getAttribute("data-tab");
+      try { history.replaceState(null, "", "#" + name); } catch (error) { }
+      show(name);
+    });
+  });
+  show(location.hash.slice(1));
+  setTimeout(function () { location.reload(); }, 60000);
+
+  // Hovering a stock, or focusing it with Tab, shows its SHAP and LIME values.
+  var payload = document.getElementById("local-explanations");
+  var explained = payload ? JSON.parse(payload.textContent) : {};
+  var entities = {"&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;"};
+  function text(value) { return String(value).replace(/[&<>"]/g, function (c) { return entities[c]; }); }
+  function points(value) { return (value >= 0 ? "+" : "") + (100 * value).toFixed(1); }
+  function bar(value, largest) {
+    var width = largest > 0 ? 48 * Math.abs(value) / largest : 0;
+    return "<span class=\\"bar\\"><i class=\\"" + (value >= 0 ? "up" : "down") + "\\" style=\\"" +
+      (value >= 0 ? "left" : "right") + ":50%;width:" + width.toFixed(1) + "%\\"></i></span>";
+  }
+  function describe(row) {
+    var model = explained[row.getAttribute("data-model")];
+    var stock = model && model.stocks[row.getAttribute("data-ticker")];
+    if (!stock) { return ""; }
+    var largest = Math.abs(stock.rest);
+    stock.features.forEach(function (f) { largest = Math.max(largest, Math.abs(f[1]), Math.abs(f[2])); });
+    var lines = stock.features.map(function (f) {
+      return "<tr><td class=\\"text\\">" + text(f[0]) + "</td><td class=\\"text\\">" + text(f[3]) + "</td><td>" +
+        bar(f[1], largest) + "</td><td>" + points(f[1]) + "</td><td>" + bar(f[2], largest) + "</td><td>" +
+        points(f[2]) + "</td></tr>";
+    });
+    lines.push("<tr><td class=\\"text muted\\">Other features</td><td></td><td>" + bar(stock.rest, largest) +
+      "</td><td>" + points(stock.rest) + "</td><td></td><td></td></tr>");
+    var fidelity = model.fidelity === null ? "n/a" : model.fidelity.toFixed(2);
+    return "<b>" + text(row.getAttribute("data-ticker")) + "</b> <span class=\\"muted\\">" +
+      text(row.getAttribute("data-model")) + "</span><div class=\\"muted\\">Rank percentile " +
+      (100 * stock.actual).toFixed(1) + " · surrogate " + (100 * stock.predicted).toFixed(1) +
+      " · average stock " + (100 * stock.base).toFixed(1) + "</div><table><tr><th class=\\"text\\">Feature</th>" +
+      "<th class=\\"text\\">Value</th><th colspan=\\"2\\">SHAP</th><th colspan=\\"2\\">LIME</th></tr>" +
+      lines.join("") + "</table><div class=\\"muted\\">In points of rank percentile (100 the best stock). The SHAP " +
+      "values add up to the surrogate's " + (100 * stock.predicted).toFixed(1) + " from the average stock's " +
+      (100 * stock.base).toFixed(1) + ". Surrogate R² " + fidelity + " on held-out stocks; LIME's local fit R² " +
+      stock.lime_fit.toFixed(2) + ".</div>";
+  }
+  function place(row) {
+    var box = row.getBoundingClientRect();
+    tip.hidden = false;
+    var top = box.bottom + 6;
+    if (top + tip.offsetHeight > window.innerHeight - 6) { top = Math.max(6, box.top - tip.offsetHeight - 6); }
+    tip.style.top = top + "px";
+    tip.style.left = Math.max(6, Math.min(box.left + 24, window.innerWidth - tip.offsetWidth - 6)) + "px";
+  }
+  document.querySelectorAll("tr[data-ticker]").forEach(function (row) {
+    function open() { var html = describe(row); if (html) { tip.innerHTML = html; place(row); } }
+    function close() { tip.hidden = true; }
+    row.addEventListener("mouseenter", open);
+    row.addEventListener("focus", open);
+    row.addEventListener("mouseleave", close);
+    row.addEventListener("blur", close);
+  });
+  window.addEventListener("scroll", function () { tip.hidden = true; }, {passive: true});
+})();
+</script>"""
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<noscript><meta http-equiv="refresh" content="60"></noscript>
+<title>ML510 recommendations</title>
+<style>{css}</style>
+</head>
+<body><main>
+{body}
+</main>
+{script}
+</body>
+</html>
+"""
+
+
+class Dashboard:
+    """Records the calls of the recommendations in settings.dashboard_dir and writes the page again after each."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.directory = Path(settings.dashboard_dir)
+        self._lock = threading.Lock()
+        self._explained = None  # (generated_at, explanation, error) of the last result explained.
+        self._local: dict = {}  # That result's SHAP and LIME values shown on hover, by (model, ticker).
+        self._backtests: dict[str, dict] = {}  # A run's tables, read once: they never change.
+
+    def record(self, method: str, limit: int, body: RecommendationList | None = None, served: list | None = None,
+               error: str | None = None, fetch: bool = False, email: bool = False) -> None:
+        """Record one call and write the page again. body is what the call returned, and served the result behind
+        it ((name, version, Recommendations, models) per model, from the API); a failed call gives its error."""
+        with self._lock:
+            call = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "method": method,
+                    "limit": limit, "error": error, "fetch": _fetch(body, fetch), "email": _email(body, email)}
+            snapshot = self._snapshot(call, body, served) if body is not None else None
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with open(self.directory / "calls.jsonl", "a", encoding="utf-8") as calls:
+                calls.write(json.dumps({**call, **(_summary(snapshot["lists"]) if snapshot else {})}) + "\n")
+            if snapshot is not None:
+                _write(self.directory / "latest.json", json.dumps(snapshot, indent=1))
+            else:
+                snapshot = self._last()
+            _write(self.directory / "index.html", render(snapshot, self._history(), call if error else None))
+
+    def page(self) -> str:
+        """The page as the last call wrote it, or one saying that no call came yet."""
+        try:
+            return (self.directory / "index.html").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return render(None, [])
+
+    def _snapshot(self, call: dict, body: RecommendationList, served: list | None) -> dict:
+        lists = _lists(body)
+        explained, problem = self._explanation(body, served)
+        return {"call": call, "lists": lists, "explanation": _explanation(explained, problem, lists, self._local),
+                "backtest": self._backtest(body.run)}
+
+    def _explanation(self, body: RecommendationList, served: list | None):
+        """The explanation of the result behind body, computed once per result: (explanation, error)."""
+        if self._explained is not None and self._explained[0] == body.generated_at:
+            return self._explained[1:]
+        if not served:  # Another call computed newer lists meanwhile; the next call explains those.
+            return None, "the lists were computed again while this call was recorded"
+        try:
+            explained, problem = explain(self.settings, served), None
+        except Exception as error:  # The lists were served; the page says why they are not explained.
+            log.exception("Dashboard: could not explain the lists")
+            explained, problem = None, f"{type(error).__name__}: {error}"
+        self._explained, self._local = (body.generated_at, explained, problem), {}
+        return explained, problem
+
+    def _backtest(self, run: str | None) -> dict | None:
+        if not run:
+            return None
+        if run not in self._backtests:
+            self._backtests[run] = backtest_results(run)
+        return self._backtests[run]
+
+    def _last(self) -> dict | None:
+        try:
+            return json.loads((self.directory / "latest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _history(self) -> list[dict]:
+        """The last HISTORY calls, newest first."""
+        try:
+            lines = (self.directory / "calls.jsonl").read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        calls = []
+        for line in reversed(lines):
+            try:
+                calls.append(json.loads(line))
+            except ValueError:
+                continue
+            if len(calls) == HISTORY:
+                break
+        return calls
+
+
+def _write(path: Path, text: str, attempts: int = 10) -> None:
+    """Replace a file at once, so a reader never sees half of it; retry while one holds it open on Windows."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    for attempt in range(attempts):
+        try:
+            return os.replace(temporary, path)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.2)
+
+
+def _number(value) -> float | None:
+    """A finite float, or None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _fetch(body: RecommendationList | None, asked: bool) -> dict | None:
+    """How the call's fetch went: None when it asked for none; errors None when its outcome is unknown."""
+    if body is not None and body.fetch is not None:
+        return {"errors": len(body.fetch.errors)}
+    return {"errors": None} if asked else None
+
+
+def _email(body: RecommendationList | None, asked: bool) -> dict | None:
+    """How the call's email went, as a count and the error's kind: never the addresses, which an error can quote."""
+    if body is not None and body.email is not None:
+        error = body.email.error.split(":", 1)[0] if body.email.error else None
+        return {"sent": len(body.email.sent_to), "error": error}
+    return {"sent": None, "error": None} if asked else None
+
+
+def _lists(body: RecommendationList) -> dict:
+    """The call's lists, by model."""
+    models: dict[str, dict] = {}
+    for side in ("buy", "sell"):
+        for item in getattr(body, side):
+            name = item.model or body.model_version
+            models.setdefault(name, {"buy": [], "sell": []})[side].append(item.model_dump(exclude={"model"}))
+    return {"as_of": body.as_of.isoformat(), "news_cutoff": body.news_cutoff.isoformat(),
+            "news_through": body.news_through.isoformat() if body.news_through else None,
+            "generated_at": body.generated_at.isoformat(), "horizon_days": body.horizon_days,
+            "model_version": body.model_version, "universe_size": body.universe_size, "run": body.run,
+            "models": models}
+
+
+def _explanation(explained, problem: str | None, lists: dict, cache: dict | None = None) -> dict:
+    """The explanation as JSON: each model's drivers; for the stocks it listed, its strongest PROFILE drivers' values
+    and percentiles; and their SHAP and LIME values from the result's surrogate, kept in cache by (model, ticker)
+    so that a stock is explained once per result."""
+    cache = {} if cache is None else cache
+    if explained is None:
+        return {"error": problem}
+    models = []
+    for model in explained.models:
+        columns = [row["feature"] for row in model.drivers if row["correlation"] is not None][:PROFILE]
+        listed = lists["models"].get(model.name, {"buy": [], "sell": []})
+        tickers = [item["ticker"] for item in listed["buy"] + listed["sell"]]
+        profile = {}
+        for ticker in tickers:
+            known = ticker in explained.features.index
+            profile[ticker] = {name: [_number(explained.features.at[ticker, name]) if known else None,
+                                      _number(explained.percentiles.at[ticker, name]) if known else None]
+                               for name in columns}
+        local_error = None
+        if model.surrogate is not None:
+            try:
+                missing = [ticker for ticker in tickers if (model.name, ticker) not in cache]
+                for ticker, found in local_explanations(model.surrogate, missing).items():
+                    cache[(model.name, ticker)] = _shown(found)
+            except Exception as error:  # The lists stay explained by their drivers.
+                log.exception("Dashboard: could not compute the SHAP and LIME values of %s", model.name)
+                local_error = f"{type(error).__name__}: {error}"
+        local = {ticker: cache[(model.name, ticker)] for ticker in tickers if (model.name, ticker) in cache}
+        models.append({"name": model.name, "version": model.version, "scored": model.scored,
+                       "drivers": model.drivers, "outputs": model.outputs, "importances": model.importances,
+                       "columns": columns, "profile": profile, "local": local, "local_error": local_error,
+                       "fidelity": model.surrogate.fidelity if model.surrogate is not None else None})
+    return {"error": None, "as_of": explained.as_of.date().isoformat(), "models": models}
+
+
+def _shown(found: dict) -> dict:
+    """What hovering a stock shows: of its SHOWN strongest features by SHAP and by LIME, those worth at least 5% of
+    the strongest value (three at least), by SHAP first, with their values; and rest, the SHAP values of the other
+    features, so that the shown ones and rest add up."""
+    shap, lime = found["shap"], found["lime"]
+    strongest = (sorted(shap, key=lambda name: -abs(shap[name]))[:SHOWN]
+                 + sorted(lime, key=lambda name: -abs(lime[name]))[:SHOWN])
+    names = sorted(set(strongest), key=lambda name: -abs(shap[name]))
+    largest = max(max(abs(shap[name]), abs(lime[name])) for name in names)
+    kept = [name for name in names if max(abs(shap[name]), abs(lime[name])) >= 0.05 * largest] if largest else []
+    names = kept if len(kept) >= 3 else names[:3]
+    rest = found["predicted"] - found["base"] - sum(shap[name] for name in names)
+    return {"actual": found["actual"], "predicted": found["predicted"], "base": found["base"], "rest": rest,
+            "lime_fit": found["lime_fit"],
+            "features": [[name, shap[name], lime[name], _feature_text(name, found["values"].get(name))]
+                         for name in names]}
+
+
+def _summary(lists: dict) -> dict:
+    """What calls.jsonl keeps of a call's lists: the date, and each model's first five buys and sells."""
+    return {"as_of": lists["as_of"], "generated_at": lists["generated_at"], "run": lists["run"],
+            "buy": {name: [item["ticker"] for item in sides["buy"][:5]] for name, sides in lists["models"].items()},
+            "sell": {name: [item["ticker"] for item in sides["sell"][:5]] for name, sides in lists["models"].items()}}
+
+
+def _read_csv(path: Path, missing: list) -> pd.DataFrame | None:
+    try:
+        return pd.read_csv(path)
+    except (OSError, ValueError):
+        missing.append(path.name)
+        return None
+
+
+def backtest_results(run: str) -> dict:
+    """Return a backtest run's out-of-sample results from its tables: each strategy's metrics over all its test years
+    (metrics.csv), its return each year (yearly.csv) and its cumulative profit (profit.csv). Nothing of TEST_YEAR or
+    later is kept, though a served run never holds any."""
+    folder = Path(run) if Path(run).is_absolute() else ROOT / run
+    tables = folder / "tables"
+    results = {"run": run, "missing": [], "models": [], "chosen_on_years": [], "strategies": [], "years": [],
+               "yearly": {}, "profit": None}
+    try:
+        selection = json.loads((folder / "selection.json").read_text(encoding="utf-8"))
+        results["models"] = [str(name) for name in selection.get("models") or {}]
+        results["chosen_on_years"] = [int(year) for year in selection.get("chosen_on_years") or []]
+    except (OSError, ValueError, TypeError):
+        results["missing"].append("selection.json")
+    metrics = _read_csv(tables / "metrics.csv", results["missing"])
+    if metrics is not None and {"strategy", "scope"} <= set(metrics.columns):
+        for row in metrics[metrics.scope.astype(str) == "all"].to_dict("records"):
+            results["strategies"].append({"strategy": str(row["strategy"]),
+                                          **{key: _number(row.get(key)) for key in METRICS}})
+    yearly = _read_csv(tables / "yearly.csv", results["missing"])
+    if yearly is not None and "strategy" in yearly:
+        results["years"] = [column for column in yearly.columns if column.isdigit() and int(column) < TEST_YEAR]
+        results["yearly"] = {str(row["strategy"]): {year: _number(row.get(year))
+                                                    for year in results["years"] + ["mean"]}
+                             for row in yearly.to_dict("records")}
+    profit = _read_csv(tables / "profit.csv", results["missing"])
+    if profit is not None and "date" in profit:
+        profit = profit[profit.date.astype(str) < f"{TEST_YEAR}-01-01"].reset_index(drop=True)
+        if len(profit):
+            step = max(1, math.ceil(len(profit) / PROFIT_POINTS))
+            sample = profit.iloc[sorted(set(range(0, len(profit), step)) | {len(profit) - 1})]
+            results["profit"] = {"dates": sample.date.astype(str).tolist(),
+                                 "series": {str(column): [_number(value) for value in sample[column]]
+                                            for column in profit.columns if column != "date"}}
+    return results
+
+
+# ---- The page ----
+
+def _et(stamp: str | None, form: str = "%Y-%m-%d %H:%M") -> str:
+    """A UTC time as New York time."""
+    if not stamp:
+        return "—"
+    return pd.Timestamp(stamp).tz_convert("America/New_York").strftime(form) + " ET"
+
+
+def _format(value, form: str) -> str:
+    """A number for the page: signed and share as percents, ratio and ic as decimals, money in dollars."""
+    value = _number(value)
+    if value is None:
+        return '<span class="muted">—</span>'
+    if form == "signed":
+        text, sign = f"{value:+.1%}", value
+    elif form == "share":
+        text, sign = f"{value:.0%}", 0
+    elif form == "money":
+        text, sign = _money(value), 0
+    elif form == "ic":
+        text, sign = f"{value:+.3f}", value
+    elif form == "score":
+        text, sign = f"{value:.4f}", 0
+    elif form == "sentiment":
+        text, sign = f"{value:+.2f}", value
+    else:
+        text, sign = f"{value:,.2f}", 0
+    color = "pos" if sign > 0 else "neg" if sign < 0 else ""
+    return f'<span class="{color}">{escape(text)}</span>' if color else escape(text)
+
+
+def _money(value: float) -> str:
+    return (f"${value / 1e9:,.2f}B" if abs(value) >= 1e9 else f"${value / 1e6:,.1f}M" if abs(value) >= 1e6
+            else f"${value:,.0f}")
+
+
+FEATURE_FORMS = {"ret_1d": "signed", "ret_5d": "signed", "ret_20d": "signed", "momentum_60d": "signed",
+                 "gap_1d": "signed", "high_60d": "signed", "volatility_20d": "share", "close_location": "ratio",
+                 "volume_ratio": "ratio", "dollar_volume_20d": "log-money", "news_count_7d": "count",
+                 "news_count_1d": "count", "impact_7d": "ratio", "earnings_7d": "flag", "dollar_volume": "money"}
+
+
+def _feature_text(name: str, value) -> str:
+    """A feature's value as plain text, as hovering a stock shows it."""
+    value = _number(value)
+    form = FEATURE_FORMS.get(name, "sentiment")
+    if value is None:
+        return "n/a"
+    if form == "log-money":
+        value, form = math.exp(value), "money"
+    texts = {"money": _money, "signed": "{:+.1%}".format, "share": "{:.1%}".format, "count": "{:,.0f}".format,
+             "ratio": "{:,.2f}".format, "sentiment": "{:+.2f}".format}
+    return ("yes" if value else "no") if form == "flag" else texts[form](value)
+
+
+def _feature(name: str, value, percentile) -> str:
+    """A feature's value as its kind reads best, with its percentile among the scored stocks."""
+    value = _number(value)
+    form = FEATURE_FORMS.get(name, "sentiment")
+    if value is None:
+        shown = '<span class="muted">—</span>'
+    elif form == "log-money":
+        shown = _format(math.exp(value), "money")
+    elif form == "count":
+        shown = f"{value:,.0f}"
+    elif form == "flag":
+        shown = "yes" if value else "no"
+    else:
+        shown = _format(value, form)
+    percentile = _number(percentile)
+    rank = f'<span class="pct">p{round(percentile * 100)}</span>' if percentile is not None else ""
+    return shown + rank
+
+
+def driver_chart(drivers: list[dict]) -> str:
+    """A bar per feature, from -1 to +1: its correlation with the ranking."""
+    label, plot, row, top = 150, 300, 18, 16
+    width, height = label + plot + 56, top + row * len(drivers) + 4
+    middle = label + plot / 2
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" '
+             f'aria-label="Correlation of each feature with the ranking">',
+             f'<text class="muted" x="{label}" y="10">-1</text>',
+             f'<text class="muted" x="{middle}" y="10" text-anchor="middle">0</text>',
+             f'<text class="muted" x="{label + plot}" y="10" text-anchor="end">+1</text>',
+             f'<line class="axis" x1="{middle}" y1="{top - 2}" x2="{middle}" y2="{height}"/>']
+    for index, driver in enumerate(drivers):
+        y = top + index * row
+        name = driver["feature"]
+        parts.append(f'<text x="{label - 8}" y="{y + 12}" text-anchor="end"><title>'
+                     f'{escape(DESCRIPTIONS.get(name, name))}</title>{escape(name)}</text>')
+        value = driver["correlation"]
+        if value is None:
+            parts.append(f'<text class="muted" x="{label + plot + 8}" y="{y + 12}">n/a</text>')
+            continue
+        length = abs(value) * plot / 2
+        start = middle if value >= 0 else middle - length
+        parts.append(f'<rect class="{"up" if value >= 0 else "down"}" x="{start:.1f}" y="{y + 3}" '
+                     f'width="{max(length, 0.5):.1f}" height="{row - 6}" rx="2"/>')
+        parts.append(f'<text x="{label + plot + 8}" y="{y + 12}">{value:+.2f}</text>')
+    return "".join(parts) + "</svg>"
+
+
+def profit_chart(profit: dict, names: dict) -> str:
+    """A line per strategy: its cumulative profit over the test years."""
+    dates, series = profit["dates"], profit["series"]
+    width, height, left, right, top, bottom = 860, 270, 70, 300, 10, 26
+    plot_width, plot_height = width - left - right, height - top - bottom
+    values = [value for points in series.values() for value in points if value is not None] + [0.0]
+    low, high = min(values), max(values)
+    span = (high - low) or 1.0
+
+    def x(index):
+        return left + plot_width * index / max(len(dates) - 1, 1)
+
+    def y(value):
+        return top + plot_height * (high - value) / span
+
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" '
+             f'aria-label="Cumulative profit of each strategy">']
+    for value in sorted({low, 0.0, high}):
+        label = f"-${-value:,.0f}" if value < 0 else f"${value:,.0f}"
+        parts.append(f'<line class="axis" x1="{left}" y1="{y(value):.1f}" x2="{left + plot_width}" y2="{y(value):.1f}"/>'
+                     f'<text class="muted" x="{left - 6}" y="{y(value) + 4:.1f}" text-anchor="end">'
+                     f'{escape(label)}</text>')
+    years: dict[str, int] = {}
+    for index, day in enumerate(dates):
+        years.setdefault(day[:4], index)
+    for year, index in years.items():
+        parts.append(f'<line class="axis" x1="{x(index):.1f}" y1="{top}" x2="{x(index):.1f}" y2="{top + plot_height}"/>'
+                     f'<text class="muted" x="{x(index) + 3:.1f}" y="{height - 8}">{escape(year)}</text>')
+    for number, (strategy, points) in enumerate(series.items()):
+        color = COLORS[number % len(COLORS)]
+        dash = {"spy_mirror": ' stroke-dasharray="5 3"', "universe_ew": ' stroke-dasharray="2 3"',
+                "account": ' stroke-dasharray="8 4"'}.get(strategy, "")
+        line = " ".join(f"{x(index):.1f},{y(value):.1f}" for index, value in enumerate(points) if value is not None)
+        parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.7"{dash} points="{line}"/>')
+        last = next((value for value in reversed(points) if value is not None), None)
+        legend_y = top + 14 + number * 18
+        parts.append(f'<line x1="{left + plot_width + 14}" y1="{legend_y - 4}" x2="{left + plot_width + 34}" '
+                     f'y2="{legend_y - 4}" stroke="{color}" stroke-width="2.5"{dash}/>'
+                     f'<text x="{left + plot_width + 40}" y="{legend_y}">{escape(names.get(strategy, strategy))}'
+                     f'{escape(f" {last:+,.0f}") if last is not None else ""}</text>')
+    return "".join(parts) + "</svg>"
+
+
+def _call_text(call: dict) -> tuple[str, str, str]:
+    """A call's result, fetch and email, in words."""
+    result = "ok" if not call.get("error") else f"failed: {call['error']}"
+    fetch = call.get("fetch")
+    fetched = ("—" if fetch is None else "asked" if fetch.get("errors") is None
+               else "ok" if fetch["errors"] == 0 else f"{fetch['errors']} download(s) failed")
+    email = call.get("email")
+    if email is None:
+        emailed = "—"
+    elif email.get("sent") is None:
+        emailed = "asked"
+    else:
+        emailed = f"sent to {email['sent']}" + (f" ({email['error']})" if email.get("error") else "")
+    return result, fetched, emailed
+
+
+def _correlation(value: float | None) -> str:
+    """A correlation with the ranking, or why there is none."""
+    return '<span class="muted">same for every stock</span>' if value is None else f"{value:+.2f}"
+
+
+def _summary_line(model: dict) -> str:
+    """One sentence on what a model's ranking follows."""
+    outputs = {row["feature"]: row["correlation"] for row in model["outputs"]}
+    drivers = [row for row in model["drivers"] if row["correlation"] is not None]
+    if outputs.get("score") is None and outputs.get("dollar_volume") is not None:
+        lead = ("Every stock gets the same score, so the stocks rank by dollar volume, the tie-break: the model "
+                "recommends the most traded stocks.")
+    else:
+        lead = "The ranking follows the model's score."
+    if drivers:
+        top = ", ".join(f"{escape(row['feature'])} ({row['correlation']:+.2f})" for row in drivers[:3])
+        lead += f" Strongest features: {top}."
+    return lead
+
+
+def _lists_section(snapshot: dict) -> str:
+    lists, explanation = snapshot["lists"], snapshot["explanation"]
+    explained = {model["name"]: model for model in explanation.get("models") or []}
+    parts = ['<section id="lists"><h2>Recommendations</h2>',
+             f'<p class="note">To trade at the next open and hold {lists["horizon_days"]} trading days. Beside each stock: '
+             f'its value of the features its model\'s ranking follows most, with its percentile among the '
+             f'{lists["universe_size"]:,} tradable stocks (p99: higher than 99% of them). Hover over a stock, or Tab '
+             f'to it, for its SHAP and LIME values: how much each feature moves it up or down the ranking.</p>']
+    if explanation.get("error"):
+        parts.append(f'<p class="banner bad">The lists are not explained: {escape(explanation["error"])}.</p>')
+    for name, sides in lists["models"].items():
+        model = explained.get(name)
+        columns = model["columns"] if model else []
+        correlation = {row["feature"]: row["correlation"] for row in model["drivers"]} if model else {}
+        parts.append(f"<h3>{escape(name)}</h3>")
+        for side, title in (("buy", "Buy"), ("sell", "Sell")):
+            head = "".join(f'<th title="{escape(DESCRIPTIONS.get(column, column))}">{escape(column)}<br>'
+                           f'<span class="pct">{correlation[column]:+.2f}</span></th>' for column in columns)
+            rows = []
+            for item in sides[side]:
+                profile = model["profile"].get(item["ticker"], {}) if model else {}
+                features = "".join(f"<td>{_feature(column, *profile.get(column, [None, None]))}</td>"
+                                   for column in columns)
+                hover = (f' data-model="{escape(name)}" data-ticker="{escape(item["ticker"])}" tabindex="0"'
+                         if model and item["ticker"] in (model.get("local") or {}) else "")
+                rows.append(f'<tr{hover}><td>{item["rank"]}</td><td class="text"><b>{escape(item["ticker"])}</b></td>'
+                            f'<td>{_format(item["score"], "score")}</td>'
+                            f'<td>{_format(item["expected_return"], "signed")}</td>'
+                            f'<td>{_format(item["news_sentiment"], "sentiment")}</td><td>{item["news_count"]}</td>'
+                            f'<td>{_format(item["close"], "ratio")}</td>'
+                            f'<td>{_format(item["dollar_volume"], "money")}</td>{features}</tr>')
+            empty = f'<tr><td colspan="{8 + len(columns)}" class="muted">None</td></tr>'
+            parts.append(f'<div class="scroll"><b>{title}</b><table><tr><th>#</th><th class="text">Ticker</th>'
+                         f'<th>Score</th><th>Exp. return</th><th>Sentiment</th><th>News</th><th>Close</th>'
+                         f'<th>$ volume/day</th>{head}</tr>{"".join(rows) or empty}</table></div>')
+    return "".join(parts) + "</section>"
+
+
+def _drivers_section(snapshot: dict) -> str:
+    explanation = snapshot["explanation"]
+    parts = ['<section id="drivers"><h2>What drives each model\'s ranking</h2>']
+    if explanation.get("error"):
+        return "".join(parts) + f'<p class="banner bad">Not explained: {escape(explanation["error"])}.</p></section>'
+    parts.append(f'<p class="note">For each feature, the Spearman correlation between its value and the model\'s '
+                 f'ranking, across the stocks the model scored on {escape(explanation["as_of"])}: +1 when the ranking '
+                 f'follows the feature exactly (a higher value ranks first), -1 when it goes the other way, n/a when '
+                 f'the value is missing for most stocks or the same for all. The news features that read LLM scores '
+                 f'stay n/a until the day\'s articles are scored. Hover a feature for its meaning.</p>')
+    for model in explanation["models"]:
+        outputs = "".join(f'<tr><td class="text" title="{escape(OUTPUTS.get(row["feature"], ""))}">'
+                          f'{escape(row["feature"])}</td><td>{_correlation(row["correlation"])}</td></tr>'
+                          for row in model["outputs"])
+        if model["importances"]:
+            ranked = sorted(model["importances"].items(), key=lambda pair: -abs(pair[1]))
+            measured = ("<b>Importances the model measures</b><table>"
+                        + "".join(f'<tr><td class="text">{escape(name)}</td><td>{value:.3f}</td></tr>'
+                                  for name, value in ranked) + "</table>")
+        else:
+            measured = ('<p class="note">The model measures no importances of its own; a fitted price or news part '
+                        'with a feature_importances() method would list them here.</p>')
+        parts.append(f'<h3>{escape(model["name"])} <span class="meta">({model["scored"]:,} stocks scored)</span></h3>'
+                     f'<p>{_summary_line(model)}</p>{_surrogate_note(model)}'
+                     f'<div class="grid"><div>{driver_chart(model["drivers"])}</div>'
+                     f'<div><b>The ranking table\'s columns</b><table>{outputs}</table>{measured}</div></div>')
+    return "".join(parts) + "</section>"
+
+
+def _surrogate_note(model: dict) -> str:
+    """What the SHAP and LIME values of a model's stocks explain, and how faithfully."""
+    if model.get("local_error"):
+        return f'<p class="banner bad">No SHAP and LIME values: {escape(model["local_error"])}.</p>'
+    if not model.get("local"):
+        return ""
+    fidelity = _number(model.get("fidelity"))
+    fit = (f"an R² of {fidelity:.2f} on the stocks held out of its fit" if fidelity is not None
+           else "too few stocks to measure its fit")
+    return (f'<p class="note">Hovering its stocks shows the SHAP and LIME values of a surrogate of this ranking: a '
+            f'gradient-boosted tree that predicts each stock\'s rank percentile from the features below and its '
+            f'dollar volume, with {fit}. The closer it is to 1, the more the values say about the model itself.</p>')
+
+
+def _finite(value):
+    """value with every float that is not finite as None, for JSON that JavaScript reads."""
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _hover_data(snapshot: dict | None) -> str:
+    """The listed stocks' SHAP and LIME values by model, as the JSON the page's script reads on hover."""
+    models = {}
+    explanation = (snapshot or {}).get("explanation") or {}
+    for model in explanation.get("models") or []:
+        if model.get("local"):
+            models[model["name"]] = {"fidelity": model.get("fidelity"), "stocks": model["local"]}
+    data = json.dumps(_finite(models), allow_nan=False).replace("</", "<\\/")
+    return f'<script type="application/json" id="local-explanations">{data}</script>'
+
+
+def _backtest_section(backtest: dict | None) -> str:
+    parts = ['<section id="backtest-results"><h2>How the served models did in the backtest</h2>']
+    if backtest is None:
+        return "".join(parts) + ('<p class="note">No backtest run is served (RECOMMENDER_MODEL_RUN is empty), so '
+                                 'there are no backtest results to show.</p></section>')
+    years = backtest["chosen_on_years"]
+    span = f"{years[0]}-{years[-1]}" if years else "the test years"
+    names = {**STRATEGIES, **{model: f"{model} (served)" for model in backtest["models"]}}
+    parts.append(f'<p class="note">Out of sample, {escape(span)}: each year is traded by models fit on the years '
+                 f'before it, buying every recommended stock for $1,000, from run '
+                 f'<code>{escape(backtest["run"])}</code>. {TEST_YEAR} is reserved for the one final evaluation, so '
+                 f'how the recommendations do in {TEST_YEAR} is not shown.</p>')
+    if backtest["strategies"]:
+        head = "".join(f'<th title="{escape(description)}">{escape(label)}</th>'
+                       for label, _, description in METRICS.values())
+        rows = "".join(f'<tr><td class="text">{escape(names.get(row["strategy"], row["strategy"]))}</td>'
+                       + "".join(f"<td>{_format(row[key], form)}</td>" for key, (_, form, _) in METRICS.items())
+                       + "</tr>" for row in backtest["strategies"])
+        parts.append(f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
+    if backtest["yearly"]:
+        head = "".join(f"<th>{escape(year)}</th>" for year in backtest["years"]) + "<th>Mean</th>"
+        rows = "".join(f'<tr><td class="text">{escape(names.get(strategy, strategy))}</td>'
+                       + "".join(f"<td>{_format(returns.get(year), 'signed')}</td>"
+                                 for year in backtest["years"] + ["mean"]) + "</tr>"
+                       for strategy, returns in backtest["yearly"].items())
+        parts.append(f'<b>Return each year</b> <span class="meta">(profit over the capital tied up)</span>'
+                     f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
+    if backtest["profit"]:
+        parts.append(f'<b>Cumulative profit</b><div class="scroll">{profit_chart(backtest["profit"], names)}</div>')
+    if backtest["missing"]:
+        parts.append(f'<p class="note">Not in the run: {escape(", ".join(backtest["missing"]))}.</p>')
+    return "".join(parts) + "</section>"
+
+
+def _history_section(history: list[dict]) -> str:
+    parts = ['<section id="calls"><h2>Calls of the API</h2>',
+             '<p class="note">Every GET or POST of /recommendations/latest, by hand or by the 16:00 email task, '
+             'newest first. Email addresses are never recorded.</p>']
+    if not history:
+        return "".join(parts) + '<p class="muted">None yet.</p></section>'
+    rows = []
+    for call in history:
+        result, fetched, emailed = _call_text(call)
+        buys = "; ".join(f"{escape(model)}: {escape(', '.join(tickers))}" for model, tickers in
+                         (call.get("buy") or {}).items())
+        status = "pos" if not call.get("error") else "neg"
+        rows.append(f'<tr><td>{escape(_et(call["at"], "%Y-%m-%d %H:%M:%S"))}</td><td class="text">'
+                    f'{escape(call["method"])}</td><td class="text {status}">{escape(result)}</td>'
+                    f'<td class="text">{escape(fetched)}</td><td class="text">{escape(emailed)}</td>'
+                    f'<td>{escape(call.get("as_of") or "—")}</td><td class="text">{buys or "—"}</td></tr>')
+    return "".join(parts) + ('<div class="scroll"><table><tr><th>When</th><th class="text">Call</th>'
+                             '<th class="text">Result</th><th class="text">Fetch</th><th class="text">Email</th>'
+                             '<th>Bars through</th><th class="text">First buys</th></tr>'
+                             f'{"".join(rows)}</table></div></section>')
+
+
+def render(snapshot: dict | None, history: list[dict], failed: dict | None = None) -> str:
+    """The page, in two tabs: the recommendations (the last lists, their explanation and the latest calls) and the
+    backtest simulation of the served run. failed is a call that just failed, shown above both tabs."""
+    parts = ["<header><h1>ML510 recommendations</h1>"]
+    if snapshot is not None:
+        lists = snapshot["lists"]
+        call = snapshot["call"]
+        _, fetched, emailed = _call_text(call)
+        fetched = "no fetch" if fetched == "—" else f"fetch {fetched}"
+        emailed = "no email" if emailed == "—" else f"email {emailed}"
+        parts.append(f'<p class="meta">Last lists: {escape(call["method"])} call at {escape(_et(call["at"]))} '
+                     f'({escape(fetched)}, {escape(emailed)}) · bars through {escape(lists["as_of"])} · '
+                     f'news before {escape(_et(lists["news_cutoff"]))} · computed {escape(_et(lists["generated_at"]))}'
+                     f' · {escape(lists["model_version"])}'
+                     + (f' from run <code>{escape(lists["run"])}</code>' if lists["run"] else "") + "</p>")
+    parts.append("</header>")
+    if failed is not None:
+        parts.append(f'<p class="banner bad">The last call, {escape(failed["method"])} at {escape(_et(failed["at"]))}, '
+                     f'failed: {escape(failed["error"] or "")}'
+                     + (' The lists below are from the last call that returned some.' if snapshot else "") + "</p>")
+    if snapshot is None:
+        recommendations = ['<p class="banner">No call of /recommendations/latest has returned lists yet. This page '
+                           'is written again at every call: by hand, or by the 16:00 email task.</p>']
+        backtest = ['<p class="note">The served run\'s backtest shows here after the first call of the API.</p>']
+    else:
+        recommendations = [_lists_section(snapshot), _drivers_section(snapshot)]
+        backtest = [_backtest_section(snapshot["backtest"])]
+    recommendations.append(_history_section(history))
+    parts.append('<nav class="tabs" role="tablist">' + "".join(
+        f'<button type="button" role="tab" id="tab-{name}" data-tab="{name}" aria-controls="panel-{name}" '
+        f'aria-selected="{"true" if index == 0 else "false"}">{escape(label)}</button>'
+        for index, (name, label) in enumerate(TABS)) + "</nav>")
+    for (name, _), content in zip(TABS, (recommendations, backtest)):
+        parts.append(f'<div class="panel" role="tabpanel" id="panel-{name}" aria-labelledby="tab-{name}">'
+                     + "".join(content) + "</div>")
+    parts.append('<p class="note">This page refreshes every minute. Every call of the API writes it again, as '
+                 'index.html in the dashboard folder (RECOMMENDER_DASHBOARD_DIR, by default data/processed/dashboard); '
+                 'the API serves it at /dashboard.</p>')
+    parts.append('<div id="tip" class="tip" role="tooltip" hidden></div>')
+    parts.append(_hover_data(snapshot))
+    return PAGE.format(css=CSS, body="\n".join(parts), script=SCRIPT)
