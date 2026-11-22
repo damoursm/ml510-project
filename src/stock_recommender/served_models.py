@@ -38,6 +38,7 @@ class SelectedModel:
     sha256: str | None
     models: object | None  # The unpickled Models or Ensemble; None when it did not load.
     error: str | None
+    pick_share: float | None = None  # In place of picks: the share of the stocks it ranks that it lists.
 
 
 @dataclass(frozen=True)
@@ -100,13 +101,18 @@ def _load_model(folder: Path, name, entry, saved) -> SelectedModel:
         sizes = {key: int(entry[key]) for key in SIZES}
     except (KeyError, TypeError, ValueError):
         sizes = dict.fromkeys(SIZES, 0)
+    share = entry.get("pick_share")  # Runs saved before picks were tuned record none: they list their picks.
+    shared = share is None or (isinstance(share, (int, float)) and not isinstance(share, bool) and 0 < share < 1)
     model = SelectedModel(str(name), str(entry.get("version", "")), **sizes,
-                          source=saved if isinstance(saved, str) else "", sha256=None, models=None, error=None)
+                          source=saved if isinstance(saved, str) else "", sha256=None, models=None, error=None,
+                          pick_share=float(share) if shared and share is not None else None)
     if not MODEL_NAME.fullmatch(model.name):
         return replace(model, error=f"{model.name!r} is not a model name of letters, digits, '_', '.' or '-'")
     if min(model.horizon_days, model.bars_lookback, model.picks) < 1 or model.news_lookback_days < 0:
         return replace(model, error="its selection entry lacks a valid horizon_days, bars_lookback, "
                                     "news_lookback_days or picks")
+    if not shared:
+        return replace(model, error=f"its selection entry's pick_share {share!r} is not a share between 0 and 1")
     pickled = folder / saved if isinstance(saved, str) else None
     if not (pickled is not None and saved.endswith(".pkl") and not Path(saved).is_absolute()
             and pickled.resolve().is_relative_to(folder)):
@@ -119,9 +125,10 @@ def _load_model(folder: Path, name, entry, saved) -> SelectedModel:
         loaded = pickle.loads(content)
         if not callable(getattr(loaded, "score", None)):
             raise TypeError(f"a {type(loaded).__name__} is not a Models or an Ensemble")
-        for key in ("version", *SIZES):  # Duck typing: an Ensemble passes too.
-            if getattr(loaded, key) != getattr(model, key):
-                raise ValueError(f"its {key} is {getattr(loaded, key)!r}, not the selection's {getattr(model, key)!r}")
+        for key in ("version", *SIZES, "pick_share"):  # Duck typing: an Ensemble passes too.
+            if getattr(loaded, key, None) != getattr(model, key):
+                raise ValueError(f"its {key} is {getattr(loaded, key, None)!r}, not the selection's "
+                                 f"{getattr(model, key)!r}")
         # Runs saved before exit settings existed record none; their models hold for their horizon.
         expected = entry.get("exit")
         if expected is not None and exit_rule(loaded).as_dict() != expected:

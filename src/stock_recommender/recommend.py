@@ -23,7 +23,8 @@ class Recommendations:
     news_through: pd.Timestamp | None  # Newest article the models saw, if any.
     universe_size: int  # Tickers that passed the price and liquidity filters.
     table: pd.DataFrame  # One row per scored ticker, best first.
-    trades: pd.DataFrame  # The model's recommended buys: its best `picks` tickers with their price (as_of's close).
+    # The model's recommended buys: its best pick_count tickers with their price (as_of's close).
+    trades: pd.DataFrame
 
 
 def news_counts(news: pd.DataFrame) -> pd.Series:
@@ -87,7 +88,14 @@ def rank(snapshot: Snapshot, models: Models) -> Recommendations:
         ["score", "dollar_volume", "ticker"], ascending=[False, False, True], ignore_index=True)
     news_through = snapshot.news.published_utc.max() if len(snapshot.news) else None
     return Recommendations(as_of, snapshot.news_cutoff, news_through, len(snapshot.universe), table,
-                           trade_list(table, models.picks))
+                           trade_list(table, pick_count(models, len(table))))
+
+
+def pick_count(models, ranked: int) -> int:
+    """How many of the `ranked` stocks a model scored at a decision it recommends buying: its best `picks`, or, with a
+    pick_share, that share of them rounded down, at least one. Ensembles carry the same two settings."""
+    share = getattr(models, "pick_share", None)
+    return models.picks if share is None else max(1, int(share * ranked + 1e-9))
 
 
 def trade_list(table: pd.DataFrame, picks: int) -> pd.DataFrame:

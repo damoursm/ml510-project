@@ -24,7 +24,7 @@ from .dashboard import Dashboard
 from .data import DataUnavailable, recent_day_files
 from .exits import exit_rule
 from .models import Models, load_models
-from .recommend import Recommendations, buy_and_sell, recommend
+from .recommend import Recommendations, buy_and_sell, pick_count, recommend
 from .refresh import Refresh
 from .schemas import ExitStrategy, FetchReport, RecommendationList
 from .served_models import Selection, load_selection
@@ -70,13 +70,15 @@ class LatestRecommendations:
                     self._inputs = inputs
             return self._result
 
-    def lists(self, limit: int) -> RecommendationList:
-        """Return the `limit` stocks to buy and to sell; DataUnavailable becomes a 503."""
+    def lists(self, limit: int | None) -> RecommendationList:
+        """Return the `limit` stocks to buy and to sell (None: as many as the model lists, recommend.pick_count);
+        DataUnavailable becomes a 503."""
         try:
             result, generated_at = self.get()
         except DataUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        buy, sell = buy_and_sell(result.table, limit)
+        buy, sell = buy_and_sell(result.table, limit if limit is not None else pick_count(self.models,
+                                                                                            len(result.table)))
         return RecommendationList(
             as_of=result.as_of.date(),
             news_cutoff=result.news_cutoff.to_pydatetime(),
@@ -103,7 +105,8 @@ class RunRecommendations(LatestRecommendations):
     """The best combination of models: the final selection of the backtest run in settings.model_run
     (served_models.py), loaded on first use, so building the app reads nothing. Each model ranks the stocks from the
     newest files, again once the downloads add or rewrite a file one of them reads, and the lists hold each one's
-    `limit` best and worst, labelled with its name."""
+    `limit` best and worst, labelled with its name: by default as many as the model lists, the number the backtest
+    chose for it (its picks, or its pick_share of the stocks it ranked)."""
 
     def __init__(self, settings: Settings, fallback: Models):
         self._selection: Selection | None = None
@@ -145,15 +148,17 @@ class RunRecommendations(LatestRecommendations):
                     self._inputs = inputs
             return self._result
 
-    def lists(self, limit: int) -> RecommendationList:
-        """Return each served model's `limit` stocks to buy and to sell; DataUnavailable becomes a 503."""
+    def lists(self, limit: int | None) -> RecommendationList:
+        """Return each served model's `limit` stocks to buy and to sell (None: as many as that model lists);
+        DataUnavailable becomes a 503."""
         try:
             results, generated_at = self.get()
         except DataUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         buy, sell = [], []
         for model, result in results:
-            best, worst = buy_and_sell(result.table, limit)
+            count = limit if limit is not None else pick_count(model.models, len(result.table))
+            best, worst = buy_and_sell(result.table, count)
             buy += [dict(row, model=model.name) for row in best.to_dict("records")]
             sell += [dict(row, model=model.name) for row in worst.to_dict("records")]
         first = results[0][1]  # Every model reads the same newest files, so they share as_of.
@@ -200,7 +205,7 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
     refresh = Refresh(settings, latest)
     board = Dashboard(settings) if settings.dashboard_dir else None
 
-    def record(method: str, limit: int, body: RecommendationList | None = None, error: str | None = None,
+    def record(method: str, limit: int | None, body: RecommendationList | None = None, error: str | None = None,
                fetch: bool = False, email: bool = False) -> None:
         """Record a call of the recommendations on the dashboard. A failure is logged, never raised: the lists
         come first."""
@@ -223,7 +228,10 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
 
     app = FastAPI(title="ML510 stock recommendations", version=__version__, lifespan=lifespan)
     app.state.refresh = refresh
-    limit_query = Query(settings.top_n, ge=1, le=500, description="Stocks in each of the buy and sell lists.")
+    limit_query = Query(settings.top_n, ge=1, le=500,
+                        description="Stocks in each of the buy and sell lists; by default each served model's own "
+                                    "number, the one its backtest chose (its picks, or its pick_share of the stocks it "
+                                    "ranked), unless RECOMMENDER_TOP_N sets one for all.")
 
     @app.get("/health")
     def health() -> dict:
@@ -238,7 +246,7 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
         return report
 
     @app.get("/recommendations/latest", response_model=RecommendationList)
-    def latest_recommendations(background: BackgroundTasks, limit: int = limit_query) -> RecommendationList:
+    def latest_recommendations(background: BackgroundTasks, limit: int | None = limit_query) -> RecommendationList:
         """Return the stocks to buy and sell at today's close, from the data on disk."""
         try:
             body = latest.lists(limit)
@@ -251,7 +259,7 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
     @app.post("/recommendations/latest", response_model=RecommendationList)
     def run_recommendations(
         background: BackgroundTasks,
-        limit: int = limit_query,
+        limit: int | None = limit_query,
         fetch: bool = Query(False, description="Download new bars and news first (about 20 s)."),
         email: str | None = Query(None, description="Email the lists to these addresses, comma-separated."),
     ) -> RecommendationList:

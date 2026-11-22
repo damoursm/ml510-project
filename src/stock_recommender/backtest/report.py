@@ -48,21 +48,31 @@ def yearly_table(result: BacktestResult) -> pd.DataFrame:
 
 
 def selection_table(result: BacktestResult) -> pd.DataFrame:
-    """Return the final choice for the 2026 test: each model of the combination, its hyperparameters, its exit
-    strategy and order value."""
-    columns = ["model", "params", "picks", "horizon_days", "hold_days", "stop_loss", "take_profit", "volatility_exit",
-               "order_value", "mean_yearly_return"]
+    """Return the final choice for the 2026 test: each model of the combination, its hyperparameters, how many stocks
+    it lists (picks, or a pick_share of those it ranks in its place), its exit strategy and order value."""
+    columns = ["model", "params", "picks", "pick_share", "horizon_days", "hold_days", "stop_loss", "take_profit",
+               "volatility_exit", "order_value", "mean_yearly_return"]
     return pd.DataFrame([{"model": name, "params": json.dumps(choice["params"]), "picks": choice["picks"],
+                          "pick_share": choice.get("pick_share"),
                           "horizon_days": choice["horizon_days"], **(choice.get("exit") or {}),
                           "order_value": choice["order_value"], "mean_yearly_return": choice["mean_yearly_return"]}
                          for name, choice in result.selection["models"].items()], columns=columns)
+
+
+def standing_table(result: BacktestResult) -> pd.DataFrame:
+    """Return how each strategy's trades stood against SPY bought with the same dollars on the same dates, over
+    every test year: the final choice's test, which keeps every strategy that beats it."""
+    columns = ["strategy", "mean_yearly_return", "spy_mirror_mean_return", "beats_spy", "in_combination"]
+    final = (result.selection.get("combination") or {}).get("strategies") or {}
+    return pd.DataFrame([{"strategy": name, **{key: entry.get(key) for key in columns[1:]}}
+                         for name, entry in final.items()], columns=columns)
 
 
 def combination_summary(result: BacktestResult) -> str:
     """Say which strategies the account traded in each test year, chosen on the test years before it, and which the
     final choice keeps for the 2026 test and the API."""
     def named(members) -> str:
-        return ", ".join(members) if members else "nothing (no model beat holding SPY)"
+        return ", ".join(members) if members else "nothing (no model's trades beat SPY)"
 
     lines = []
     for row in result.folds.itertuples():
@@ -77,6 +87,33 @@ def combination_summary(result: BacktestResult) -> str:
 
 def _percent(digits: int):
     return lambda x: f"{x:+.{digits}%}" if pd.notna(x) else ""
+
+
+def validation_summary(result: BacktestResult) -> str:
+    """Say how each test year's account, its chosen candidates trading together, did in the years that chose it,
+    and how the final choice did in every test year: in sample, since those years chose them, unlike the account's
+    own row, which only ever trades a year its choice did not see."""
+    percent, lines = _percent(1), []
+
+    def line(name: str, members, returns: dict, mean, spy) -> str:
+        held = f", SPY held {percent(spy)}" if pd.notna(spy) else ""  # Data without SPY has nothing to show.
+        return (f"  {name} ({', '.join(members) or 'nothing'}): "
+                + ", ".join(f"{year} {percent(value)}" for year, value in returns.items())
+                + f"; mean {percent(mean)}{held}")
+
+    for row in result.folds.itertuples():
+        checked = json.loads(getattr(row, "account_validation_returns", None) or "{}")
+        if checked:
+            lines.append(line(str(row.fold), json.loads(row.combination), checked, row.account_validation_return,
+                              row.spy_hold_validation_return))
+    final = result.selection.get("combination") or {}
+    returns = final.get("account_return_by_year") or {}
+    if returns:
+        held = [value for value in (result.selection.get("nested_estimate") or {}).get("spy_hold_return", {}).values()
+                if value is not None and pd.notna(value)]
+        lines.append(line("2026 test and the API", final.get("models") or [], returns,
+                          final.get("account_mean_yearly_return"), float(np.mean(held)) if held else np.nan))
+    return "\n".join(lines)
 
 
 def format_summary(result: BacktestResult) -> str:
@@ -94,10 +131,21 @@ def format_summary(result: BacktestResult) -> str:
     years = yearly_table(result)
     for column in years.columns[1:]:
         years[column] = years[column].map(_percent(1))
-    return (f"{table.to_string(index=False)}\n\nReturn per test year (profit over capital, "
-            f"${result.config.order_value:,.0f} per order):\n{years.to_string(index=False)}\n\n"
-            f"Models the account traded (only those whose mean yearly return beat SPY held qualify; then the set of "
-            f"them with the best account):\n{combination_summary(result)}")
+    standing = standing_table(result)
+    for column in ("mean_yearly_return", "spy_mirror_mean_return"):
+        standing[column] = standing[column].map(_percent(1))
+    against = (f"\n\nEach model's trades against SPY bought with the same dollars on the same dates, over every test "
+               f"year (the final choice keeps those that beat it):\n{standing.to_string(index=False)}"
+               if len(standing) else "")
+    checked = validation_summary(result)
+    validated = (f"\n\nEach test year's account evaluated in the years that chose it, and the final choice's in "
+                 f"every test year (in sample: what the choice saw, not what to expect; the account's row above is the "
+                 f"out-of-sample result):\n{checked}" if checked else "")
+    return (f"{table.to_string(index=False)}\n\nReturn per test year (last equity over the "
+            f"${result.config.capital:,.0f} capital, minus 1; ${result.config.order_value:,.0f} per order):\n"
+            f"{years.to_string(index=False)}\n\n"
+            f"Models the account traded (every model whose trades beat SPY bought with the same dollars on the same "
+            f"dates, over the test years before):\n{combination_summary(result)}{against}{validated}")
 
 
 def profit_figure(result: BacktestResult):
@@ -122,9 +170,9 @@ def profit_figure(result: BacktestResult):
     axis.spines["bottom"].set_color(GRID)
     axis.tick_params(colors=INK_SECONDARY, length=0)
     # A bare $ starts matplotlib's math text: escape it.
-    axis.set_title(f"Profit from \\$0 at \\${result.config.order_value:,.0f} per order, test years added up, out of "
-                   f"sample {result.config.test_years[0]}-{result.config.test_years[-1]}", loc="left", color=INK,
-                   fontsize=12)
+    axis.set_title(f"Profit on \\${result.config.capital:,.0f} a test year in \\${result.config.order_value:,.0f} "
+                   f"slices, test years added up, out of sample "
+                   f"{result.config.test_years[0]}-{result.config.test_years[-1]}", loc="left", color=INK, fontsize=12)
     axis.set_ylabel("Profit at the close (\\$)", color=INK_SECONDARY)
     legend = axis.legend(frameon=False, loc="upper left", ncols=min(len(columns), 4))
     for text in legend.get_texts():
@@ -149,7 +197,7 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
     run.save_table("yearly", yearly_table(result))
     run.save_table("metrics", result.metrics)
     run.save_table("scores", result.scores)
-    run.save_table("combinations", result.combinations)
+    run.save_table("against_spy", result.against_spy)
     run.save_table("profit", result.profit.rename_axis("date"), index=True)
     run.save_table("folds", result.folds)
     run.save_table("orders", result.orders)
@@ -166,13 +214,13 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
         f"years before it, and its hyperparameters are chosen on the test years before it. The account starts each "
         f"test year with ${result.config.capital:,.0f} and buys the stocks recommended by the models chosen for the "
         f"year in slices of ${result.config.order_value:,.0f}, at the 16:00 close of the day they are recommended, "
-        f"while its cash lasts: on the test years before it, only the models whose mean yearly return beat SPY held "
-        f"qualify, and the set of them whose account did best is traded. A return is the last equity over the "
-        f"starting capital, minus 1.\n\n```\n{format_summary(result)}\n```\n\n"
+        f"while its cash lasts: every model whose trades beat SPY bought with the same dollars on the same dates, on "
+        f"the test years before it, is traded. A return is the last equity over the starting capital, minus 1."
+        f"\n\n```\n{format_summary(result)}\n```\n\n"
         f"Final choice for the 2026 test and the API (selection.json):\n\n"
         f"```\n{selection_table(result).to_string(index=False)}\n```",
         inspect_first=["tables/summary.csv", "tables/yearly.csv", "selection.json", "tables/folds.csv",
-                       "tables/combinations.csv", "figures/profit.png", "guards.json", "tables/scores.csv",
+                       "tables/against_spy.csv", "figures/profit.png", "guards.json", "tables/scores.csv",
                        "tables/metrics.csv"])
     return run.directory
 

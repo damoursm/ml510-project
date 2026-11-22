@@ -1,10 +1,10 @@
 """Run a nested walk-forward backtest over 2021-2025, never 2026: fit each model candidate on the years before a
 test year, trade that year, and choose a test year's hyperparameters on earlier years only.
 
-A candidate is a model with one hyperparameter configuration (registry.GRIDS), its exit strategy included
-(exits.py). For each test year Y, every candidate is fit on all the years before Y (training labels end before Y's
-first trade), then trades Y alone; candidates that differ only in their exit strategy share one fit and one
-ranking:
+A candidate is a model with one hyperparameter configuration (registry.GRIDS), its exit strategy (exits.py) and how
+many of each day's ranked stocks it lists (picks: its best N, or its best X%) included. For each test year Y, every
+candidate is fit on all the years before Y (training labels end before Y's first trade), then trades Y alone;
+candidates that differ only in their exit strategy or picks share one fit and one ranking:
 - at every session's close (config.decide_every) it ranks the stocks through rank, the API's own decision path,
   as the API's daily lists do, at 16:00;
 - from config.capital ($10,000) in cash, it buys that day's list at that close in slices of the order value ($100),
@@ -17,12 +17,15 @@ Its yearly return is its last equity (cash and open lots) over its starting capi
 
 For a test year T, each model runs the candidate with the best mean yearly return over the test years before T;
 the first test year has no earlier year to choose on, so it runs the defaults. The account, the combination model,
-trades the lists of the strategies (models and ensembles) chosen for T on those same years (choose_combination):
-only the strategies whose mean yearly return, each trading alone as chosen, beats SPY held over the same opens
-qualify, and the set of them whose account has the best mean yearly return wins. The first test year trades every
-strategy, all from the one capital; a year where none qualifies trades nothing. The references spend the account's
-money otherwise: SPY held with its capital through the year, and SPY or the equal-weight universe bought for every
-order it filled.
+trades from the one capital every strategy (model or ensemble) whose trades beat SPY on those same years
+(choose_combination): trading alone as chosen, its mean yearly return beats that of SPY bought with the same dollars
+on the same dates (spy_table), so only the days it had trades open count. The first test year trades every
+strategy; a year where none qualifies trades nothing. The references spend the account's money otherwise: SPY held
+with its capital through the year, and SPY or the equal-weight universe bought for every order it filled.
+
+The account is also evaluated in the years that chose it, as each candidate is: each test year's account (its chosen
+candidates trading together from the one capital) in every test year before it, and the final choice's in every test
+year (_account_return). Those years chose it, so this is in sample: what the choice saw, not what to expect.
 
 Training data never comes after the year it is scored on, and no choice for a year sees that year or a later one.
 The choice made on every test year (each model's hyperparameters, then the combination), with the combination's
@@ -30,7 +33,6 @@ models fit on all of 2021-2025, is kept for the 2026 test, which this never runs
 Returns are total returns: dividends are reinvested.
 """
 from dataclasses import dataclass, field, replace
-from itertools import combinations
 import json
 from pathlib import Path
 from typing import Callable
@@ -41,20 +43,25 @@ from ..config import ROOT, Settings
 from ..data import DataUnavailable
 from ..ensemble import Ensemble
 from ..exits import EXIT_FIELDS, ExitRule, exit_rule
-from ..recommend import buy_and_sell, decision_inputs, news_cutoff, rank, trade_list
+from ..recommend import buy_and_sell, decision_inputs, news_cutoff, pick_count, rank, trade_list
 from . import metrics
 from .account import CAPITAL, ORDER_COLUMNS, Book, Ledger, basket, book, hold, holdings, idle_ledger, mirror, trade
 from .panel import Panel
 from .protocol import FoldData, check_test_years, news_window, schedule, walk_forward
-from .registry import GRIDS, MODELS, UNTUNED, build, configurations
+from .registry import GRIDS, MODELS, UNTUNED, build, configurations, configure
 from .window import END_UTC, LAST_DAY, LeakageError, WindowedStore
 
 ACCOUNT = "account"
 # SPY held with the account's capital; SPY, and the equal-weight universe, bought for every order the account filled.
 BENCHMARKS = ("spy_hold", "spy_mirror", "universe_ew")
 EXTREME = np.log(2)  # A holding that more than doubles or halves is listed in anomalies.
-SPY = "SPY"  # A strategy enters the account only when it beats this ticker held over the same opens.
-MAX_STRATEGIES = 10  # The account tries every set of them: 2**10 - 1 sets in each test year.
+SPY = "SPY"  # A strategy enters the account only when its trades beat this ticker bought on the same dates.
+# spy_table: per strategy and test year, its trades alone beside the same dollars spent on SPY on their dates.
+SPY_COLUMNS = ["strategy", "candidate", "year", "days_with_trades", "profit", "yearly_return", "spy_mirror_profit",
+               "spy_mirror_return"]
+# A candidate's settings that change only how its lists are traded, never its fit (its exit rule and how many stocks
+# it lists): candidates that differ only in them share one fit and one ranking per day.
+TRADING_FIELDS = (*EXIT_FIELDS, "picks")
 
 
 @dataclass(frozen=True)
@@ -108,9 +115,6 @@ class BacktestConfig:
         reserved = set(BENCHMARKS) | {ACCOUNT}
         if len(set(names)) != len(names) or set(names) & reserved:
             raise ValueError(f"Strategy names must be unique and differ from {sorted(reserved)}; got {names}.")
-        if len(names) > MAX_STRATEGIES:
-            raise ValueError(f"At most {MAX_STRATEGIES} models and ensembles: the account tries every set of them; "
-                             f"got {len(names)}.")
         check_test_years(self.test_years)  # Before any data is read.
 
     @property
@@ -127,17 +131,25 @@ class Candidate:
 
 @dataclass
 class Run:
-    """One candidate trading one test year, with models fit on the years before it."""
+    """One candidate trading one test year, with models fit on the years before it. Only the candidates chosen for
+    the year keep what they traded (book onward); the others keep their score, which is all a later choice reads."""
     candidate: Candidate
     year: int
-    book: Book  # Its recommended lists (one per holding period) priced, each stock for the order value.
-    ledger: Ledger  # The candidate trading its lists alone, from the starting capital, a slice per stock.
-    table: pd.DataFrame  # One row per holding period (account.holdings): its cost, profit and turnover.
-    positions: pd.DataFrame  # One row per order of the ledger, with its return and how it exited.
-    signals: list
-    picks: int
+    score: dict  # Its row of the scores table.
+    picks: int  # How many stocks it lists: its best picks, or with a pick_share that share of those it ranked.
+    pick_share: float | None
+    sizes: tuple  # Per holding period, the stocks on its list.
     horizon: int  # Its holding: the hold_days of its exit rule.
     rule: ExitRule | None = None
+    book: Book | None = None  # Its recommended lists (one per holding period) priced, each stock for the order value.
+    ledger: Ledger | None = None  # The candidate trading its lists alone, from the starting capital, a slice each.
+    table: pd.DataFrame | None = None  # One row per holding period (account.holdings): its cost, profit, turnover.
+    positions: pd.DataFrame | None = None  # One row per order of the ledger, with its return and how it exited.
+    signals: list = field(default_factory=list)
+    # Its lists, one per holding period, and those periods: what prices its book again when it did not keep it, to
+    # evaluate an account holding it (_book). The lists are the day's rankings' own, shared between candidates.
+    lists: list = field(default_factory=list)
+    periods: list = field(default_factory=list)
 
 
 @dataclass
@@ -157,8 +169,9 @@ class BacktestResult:
     selection: dict  # The final choice, made on every test year, for the 2026 test.
     versions: dict = field(default_factory=dict)
     final_models: dict = field(default_factory=dict)  # Fit on 2021-2025 for the 2026 test; never scored here.
-    # Per set of strategies and test year: the set trading together, as chosen, and SPY held over the same opens.
-    combinations: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Per strategy and test year: it trading alone, as chosen, beside SPY bought with the same dollars on the same
+    # dates (spy_table), which choose_combination reads.
+    against_spy: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def load_data(config: BacktestConfig) -> tuple[WindowedStore, Panel, pd.DataFrame]:
@@ -188,53 +201,48 @@ def _candidates(config: BacktestConfig, factories: dict[str, Callable], grids: d
     for name in dict.fromkeys(list(config.models) + members):
         untuned = sorted(UNTUNED & set(grids.get(name, {})))
         if untuned:
-            raise ValueError(f"{name}'s grid names {untuned}: every recommended stock is bought for the order value, "
-                             "so how many a model recommends is its own and never tuned.")
+            raise ValueError(f"{name}'s grid names {untuned}: a grid gives a share of the ranked stocks as picks, "
+                             "e.g. \"1%\".")
     candidates = []
     for name in config.models:
         for params in configurations(grids.get(name, {})):
             candidates.append(Candidate(name, tuple(sorted(params.items())), _label(name, params)))
     candidates += [Candidate(name, (), name) for name, _ in config.ensembles]
-    picks: dict[str, set] = {}
     for candidate in candidates:
         if candidate.model in config.models:
             try:
-                model = build(factories[candidate.model], dict(candidate.params))
-            except TypeError as error:
+                build(factories[candidate.model], dict(candidate.params))
+            except (TypeError, ValueError) as error:
                 raise ValueError(f"{candidate.label} does not build: {error}") from error
-            picks.setdefault(candidate.model, set()).add(model.picks)
-    for name, values in picks.items():  # Nor through a hyperparameter of the model's own that sets picks.
-        if len(values) > 1:
-            raise ValueError(f"{name}'s grid changes picks ({sorted(values)}): every recommended stock is bought for "
-                             "the order value, so how many a model recommends is its own and never tuned.")
     return candidates
 
 
 def _trained(name: str, params: dict) -> str:
-    """The label of what a candidate fits: its model and hyperparameters without its exit settings, which change
-    only how its lists are traded."""
-    return _label(name, {key: value for key, value in params.items() if key not in EXIT_FIELDS})
+    """The label of what a candidate fits: its model and hyperparameters without its trading settings (its exit rule
+    and picks, TRADING_FIELDS), which change only how its lists are traded."""
+    return _label(name, {key: value for key, value in params.items() if key not in TRADING_FIELDS})
 
 
 def _fit(specs: dict[str, tuple[str, dict]], config, factories, grids, panel, news, settings,
          cutoff: pd.Timestamp) -> tuple[dict, str | None]:
     """Fit fresh models for every candidate label (its model and hyperparameters), each on training data cut at
-    cutoff with its own windows and horizon; candidates that differ only in their exit settings share one fit, and
-    an ensemble is built from its members' fits. Return them by label and the last training label's exit."""
+    cutoff with its own windows and horizon; candidates that differ only in their trading settings (exit rule and
+    picks) share one fit, and an ensemble is built from its members' fits. Return them by label and the last
+    training label's exit."""
     fitted, training, trained = {}, {}, {}
     ensembles = dict(config.ensembles)
 
     def fit(name: str, params: dict):
         key = _trained(name, params)
         if key not in trained:
-            model = build(factories[name], {k: v for k, v in params.items() if k not in EXIT_FIELDS})  # Fresh.
+            model = build(factories[name], {k: v for k, v in params.items() if k not in TRADING_FIELDS})  # Fresh.
             data = (model.horizon_days, model.bars_lookback, model.news_lookback_days)
             if data not in training:
                 training[data] = FoldData(panel, news, settings, cutoff, *data)
             model.fit(training[data])
             trained[key] = model
-        exits = {k: v for k, v in params.items() if k in EXIT_FIELDS}
-        return replace(trained[key], **exits) if exits else trained[key]
+        trading = {k: v for k, v in params.items() if k in TRADING_FIELDS}
+        return configure(trained[key], trading) if trading else trained[key]
 
     for label, (name, params) in specs.items():
         if name not in ensembles:
@@ -255,20 +263,37 @@ def _fit(specs: dict[str, tuple[str, dict]], config, factories, grids, panel, ne
     return fitted, str(max(exits).date()) if exits else None
 
 
+def _score(candidate: Candidate, year: int, ledger: Ledger, table: pd.DataFrame, signals: list, sizes: list) -> dict:
+    """A run's row of the scores table: how the candidate did trading its lists alone, which select reads."""
+    summary = metrics.ledger_performance(ledger.path, table)
+    ic = pd.Series([signal["ic"] for signal in signals], dtype=float)
+    return {"model": candidate.model, "candidate": candidate.label,
+            "params": json.dumps(dict(candidate.params), default=str), "year": year, "capital": ledger.capital,
+            "profit": float(ledger.profit.iloc[-1]), "yearly_return": ledger.yearly_return,
+            "daily_return": summary.get("daily_return"), "sharpe": summary.get("sharpe"),
+            "max_drawdown": summary.get("max_drawdown"), "periods": summary.get("periods"),
+            "avg_turnover": summary.get("avg_turnover"),
+            "stocks_per_list": float(np.mean(sizes)) if sizes else np.nan,
+            "ic_mean": float(ic.mean()) if ic.notna().any() else np.nan}
+
+
 def _trade_year(fold, candidates: list[Candidate], fitted: dict, panel: Panel, news: pd.DataFrame,
-                settings: Settings, config: BacktestConfig) -> dict[str, Run]:
+                settings: Settings, config: BacktestConfig, keep: set | None = None) -> dict[str, Run]:
     """Trade every candidate through the fold's year, each on its schedule (a decision every config.decide_every
-    sessions, by default every session) and with its own exit rule; return its run by label. On a decision day the
-    models share one snapshot of the inputs per window, and candidates sharing a fit (they differ only in their exit
-    settings) rank the stocks once."""
+    sessions, by default every session), with its own exit rule and list size (recommend.pick_count); return its
+    run by label. On a decision day the models share one snapshot of the inputs per window, and candidates sharing a
+    fit (they differ only in their exit settings or picks) rank the stocks once. Only the candidates in `keep` (all
+    when None) keep what they traded; the others keep their score."""
     year = fold.year
     models = {candidate.label: fitted[candidate.label] for candidate in candidates}
     rules = {label: exit_rule(model) for label, model in models.items()}
     rankers = {candidate.label: _trained(candidate.model, dict(candidate.params)) for candidate in candidates}
-    schedules = {}
+    schedules, by_holding = {}, {}
     for label, model in models.items():
         holding = rules[label].hold_days
-        periods = schedule(panel.sessions, [fold], holding, config.offset, config.decide_every)[year]
+        if holding not in by_holding:  # One schedule per holding, shared by the candidates that hold as long.
+            by_holding[holding] = schedule(panel.sessions, [fold], holding, config.offset, config.decide_every)[year]
+        periods = by_holding[holding]
         if not periods:
             raise ValueError(f"No {holding}-session holding fits in {year}.")
         if periods[0].decision < model.bars_lookback - 1:
@@ -295,37 +320,53 @@ def _trade_year(fold, candidates: list[Candidate], fitted: dict, panel: Panel, n
                 tables[ranker, t] = rank(snapshots[inputs], model).table
             except DataUnavailable:
                 tables[ranker, t] = pd.DataFrame(columns=["ticker", "close", "score"])
-    decisions, chosen, reasons, runs = {}, {}, {}, {}  # Kept per decision; the forward returns are not.
+    pickers: dict[str, dict] = {}  # A ranking -> the pick rules (picks, pick_share) of the candidates sharing it.
+    for candidate in candidates:
+        model = models[candidate.label]
+        picking = (model.picks, getattr(model, "pick_share", None))
+        pickers.setdefault(rankers[candidate.label], {}).setdefault(picking, model)
+    # Kept per decision, holding and list size: the lists, their signals and how each listed stock exits at the end of
+    # the holding. The forward returns are not: each is read once, for every list size taken from its ranking.
+    decisions, chosen, reasons, runs = {}, {}, {}, {}
     for candidate in candidates:
         label = candidate.label
-        model, rule, periods = models[label], rules[label], schedules[label]
-        picks = model.picks  # The model's own: never tuned.
-        lists, exits, signals = [], [], []
+        model, rule, periods, ranker = models[label], rules[label], schedules[label], rankers[label]
+        lists, exits, signals, sizes = [], [], [], []
         for period in periods:
-            ranked = (rankers[label], period.decision)
-            table = tables[ranked]
-            key = (*ranked, rule.hold_days)
-            if ranked not in chosen:
-                chosen[ranked] = trade_list(table, picks)
+            t = period.decision
+            table = tables[ranker, t]
+            size = pick_count(model, len(table))
+            key = (ranker, t, rule.hold_days, size)
             if key not in decisions:  # The signal reads the whole holding, whatever the exit rule does.
-                forward = panel.forward_returns(period.decision, rule.hold_days, table.ticker)
+                forward = panel.forward_returns(t, rule.hold_days, table.ticker)
                 returns = forward.forward_return
-                buys, sells = buy_and_sell(table, picks)
-                reasons[key] = forward.exit_reason.reindex(chosen[ranked].ticker).to_numpy(dtype=object)
-                decisions[key] = {
-                    "decision_date": panel.sessions[period.decision], "scored": len(table),
-                    # Decisions closer than their holding share sessions (metrics.signal_summary).
-                    "holding": rule.hold_days, "every": config.decide_every or rule.hold_days,
-                    "ic": metrics.information_coefficient(table.set_index("ticker").score, returns),
-                    "spread": returns.reindex(buys.ticker).mean() - returns.reindex(sells.ticker).mean()
-                    if len(buys) and len(sells) else np.nan}
-            lists.append(chosen[ranked])
+                ic = metrics.information_coefficient(table.set_index("ticker").score, returns)
+                for count in {pick_count(other, len(table)) for other in pickers[ranker].values()}:
+                    if (ranker, t, count) not in chosen:
+                        chosen[ranker, t, count] = trade_list(table, count)
+                    buys, sells = buy_and_sell(table, count)
+                    reasons[ranker, t, rule.hold_days, count] = forward.exit_reason.reindex(
+                        chosen[ranker, t, count].ticker).to_numpy(dtype=object)
+                    decisions[ranker, t, rule.hold_days, count] = {
+                        "decision_date": panel.sessions[t], "scored": len(table), "picks": count,
+                        # Decisions closer than their holding share sessions (metrics.signal_summary).
+                        "holding": rule.hold_days, "every": config.decide_every or rule.hold_days, "ic": ic,
+                        "spread": returns.reindex(buys.ticker).mean() - returns.reindex(sells.ticker).mean()
+                        if len(buys) and len(sells) else np.nan}
+            lists.append(chosen[ranker, t, size])
             exits.append(reasons[key])
+            sizes.append(size)
             signals.append({"strategy": candidate.model, "candidate": label, "fold": year, **decisions[key]})
         item = book(panel, candidate.model, periods, lists, config.order_value, rule)
         ledger = trade(panel.sessions, [item], config.cost_bps, config.whole_shares, record=True,
                        capital=config.capital)
         table = holdings(ledger, periods, panel.sessions).assign(fold=year)
+        light = Run(candidate, year, _score(candidate, year, ledger, table, signals, sizes), model.picks,
+                    getattr(model, "pick_share", None), tuple(sizes), rule.hold_days, rule, lists=lists,
+                    periods=periods)
+        if keep is not None and label not in keep:
+            runs[label] = light  # Not traded this year: its score is all a later choice reads.
+            continue
         orders = ledger.orders  # In the book's order: period by period, each list's stocks in turn.
         with np.errstate(divide="ignore", invalid="ignore"):
             returned = np.where(orders.cost > 0, orders.exit_value / orders.cost - 1, np.nan)
@@ -334,7 +375,7 @@ def _trade_year(fold, candidates: list[Candidate], fitted: dict, panel: Panel, n
         exited = np.where(early != "", early, exited)  # Sold by its exit rule, or at the end of its holding.
         positions = orders.assign(fold=year, forward_return=returned,  # How it exited, when it was bought.
                                   exit_reason=np.where(orders.cost > 0, exited, None))
-        runs[label] = Run(candidate, year, item, ledger, table, positions, signals, picks, rule.hold_days, rule)
+        runs[label] = replace(light, book=item, ledger=ledger, table=table, positions=positions, signals=signals)
     return runs
 
 
@@ -359,10 +400,12 @@ def _references(panel: Panel, account: Ledger, books: list[Book], universe: Call
                 config: BacktestConfig) -> dict[str, Ledger]:
     """Spend the account's money otherwise through its year, from the same capital, with fractional shares: on SPY
     held with all of it from its first entry to its last exit, and on SPY or the equal-weight universe for every
-    order it filled (account.spent, one array per book), with that order's dollars and dates."""
+    order it filled (account.spent, one array per book), with that order's dollars and dates: every one of them,
+    whatever their own cash."""
     amounts = list(account.spent)
     start, end = min(item.start for item in books), max(item.end for item in books)
-    spend = lambda items: trade(panel.sessions, items, config.cost_bps, capital=config.capital)  # noqa: E731
+    spend = lambda items: trade(panel.sessions, items, config.cost_bps, capital=config.capital,  # noqa: E731
+                                cash_limit=False)
     return {"spy_hold": spend([hold(panel, "SPY", start, end, config.capital)]),
             "spy_mirror": spend([mirror(panel, item, paid) for item, paid in zip(books, amounts)]),
             "universe_ew": spend([basket(panel, item, paid, universe) for item, paid in zip(books, amounts)])}
@@ -374,16 +417,21 @@ def _random_list(universe: pd.DataFrame, rng: np.random.Generator, picks: int) -
     return pd.DataFrame({"ticker": tickers, "price": universe.close.reindex(tickers).to_numpy(dtype=float)})
 
 
-def _null_ledgers(fold, picks: int, horizon: int, reference: int, panel: Panel, settings: Settings,
+def _null_ledgers(fold, sizes: tuple, horizon: int, reference: int, panel: Panel, settings: Settings,
                   config: BacktestConfig, rule: ExitRule | None = None) -> list[Ledger]:
-    """Trade null_seeds random lists of `picks` stocks through the year, on a model's schedule and holding and with
-    its exit rule: no-skill models. The draws do not depend on the rule, so rules are compared on the same lists."""
+    """Trade null_seeds random lists through the year, on a model's schedule and holding and with its exit rule, each
+    as long as the model's list that day (sizes, one per holding period): no-skill models. The draws depend on
+    neither the rule nor the sizes (a shorter list is the start of a longer one), so rules and list sizes are
+    compared on the same lists."""
     year = fold.year
     periods = schedule(panel.sessions, [fold], horizon, config.offset, config.decide_every)[year]
+    if len(sizes) != len(periods):
+        raise ValueError(f"{len(sizes)} list sizes for {len(periods)} holding periods in {year}.")
     ledgers = []
     for seed in range(config.null_seeds):
-        rng = np.random.default_rng([seed, year, picks, horizon])
-        lists = [_random_list(panel.universe(period.decision, reference, settings), rng, picks) for period in periods]
+        rng = np.random.default_rng([seed, year, horizon])
+        lists = [_random_list(panel.universe(period.decision, reference, settings), rng, size)
+                 for period, size in zip(periods, sizes)]
         ledgers.append(trade(panel.sessions, [book(panel, "null", periods, lists, config.order_value, rule)],
                              config.cost_bps, config.whole_shares, capital=config.capital))
     return ledgers
@@ -408,12 +456,6 @@ def select(scores: pd.DataFrame, candidates: list[Candidate], years, before: int
     return chosen
 
 
-def _sets(names) -> list[tuple[str, ...]]:
-    """Every non-empty set of the strategies: the larger sets first, each size in the strategies' order."""
-    names = list(names)
-    return [members for size in range(len(names), 0, -1) for members in combinations(names, size)]
-
-
 def _strict_mean(values) -> float:
     """The mean; NaN when there is no value or one is NaN, so that a year without a return never helps."""
     array = np.asarray(list(values), dtype=float)
@@ -424,57 +466,66 @@ def _finite(value) -> float | None:
     return float(value) if value is not None and np.isfinite(value) else None
 
 
-def combination_table(names, years, choices: dict, runs: dict, panel: Panel, config: BacktestConfig) -> pd.DataFrame:
-    """Trade every non-empty set of the strategies together in every test year, each strategy as chosen for that
-    year, from the one capital, and hold SPY over the same closes: one row per set and year, which
-    choose_combination reads. A set of one is its strategy trading alone."""
-    spy, rows = {}, []
+def _book(run: Run, panel: Panel, config: BacktestConfig) -> Book:
+    """A run's book: the one it kept as its year's choice, else its lists priced again (account.book)."""
+    if run.book is not None:
+        return run.book
+    return book(panel, run.candidate.model, run.periods, run.lists, config.order_value, run.rule)
+
+
+def _account_return(runs: dict, labels: list, year: int, panel: Panel, config: BacktestConfig) -> float:
+    """The yearly return of the account trading these candidates' lists together through `year`, from the one
+    capital, as the account trades its year's choice; 0 with no candidate: an account that stands aside."""
+    if not labels:
+        return 0.0
+    books = [_book(runs[label, year], panel, config) for label in labels]
+    return trade(panel.sessions, books, config.cost_bps, config.whole_shares, capital=config.capital).yearly_return
+
+
+def spy_table(names, years, choices: dict, runs: dict, panel: Panel, config: BacktestConfig) -> pd.DataFrame:
+    """Each strategy trading alone in every test year, as chosen for that year, beside SPY bought with the same
+    dollars on the same dates: each order it filled spent on SPY at its entry close and sold when it was
+    (account.mirror), whatever the mirror's own cash. One row per strategy and year (SPY_COLUMNS), which
+    choose_combination reads; days_with_trades counts the closes where it held a lot, the only days either holds
+    anything."""
+    rows = []
     for year in years:
-        for members in _sets(names):
-            books = [runs[choices[year][name], year].book for name in members]
-            ledger = trade(panel.sessions, books, config.cost_bps, config.whole_shares, capital=config.capital)
-            span = (min(item.start for item in books), max(item.end for item in books))
-            if span not in spy:
-                spy[span] = trade(panel.sessions, [hold(panel, SPY, *span, config.capital)], config.cost_bps,
-                                  capital=config.capital).yearly_return
-            rows.append({"combination": "+".join(members), "members": json.dumps(list(members)),
-                         "size": len(members), "year": year, "capital": ledger.capital,
-                         "profit": float(ledger.profit.iloc[-1]), "yearly_return": ledger.yearly_return,
-                         "spy_hold_return": spy[span]})
-    return pd.DataFrame(rows)
+        for name in names:
+            run = runs[choices[year][name], year]
+            (paid,) = run.ledger.spent
+            spy = trade(panel.sessions, [mirror(panel, run.book, paid, SPY)], config.cost_bps,
+                        capital=config.capital, cash_limit=False)
+            rows.append({"strategy": name, "candidate": run.candidate.label, "year": year,
+                         "days_with_trades": int((run.ledger.invested > 0).sum()),
+                         "profit": float(run.ledger.profit.iloc[-1]), "yearly_return": run.ledger.yearly_return,
+                         "spy_mirror_profit": float(spy.profit.iloc[-1]), "spy_mirror_return": spy.yearly_return})
+    return pd.DataFrame(rows, columns=SPY_COLUMNS)
 
 
 def choose_combination(table: pd.DataFrame, names, years, before: int | None = None
-                       ) -> tuple[tuple[str, ...], float, dict]:
-    """Return the strategies the account trades, chosen on `years` of combination_table; that set's mean yearly
-    return there; and how each strategy stood against SPY.
+                       ) -> tuple[tuple[str, ...], dict]:
+    """Return the strategies the account trades, chosen on `years` of spy_table, and how each stood against SPY.
 
     With no year to choose on, every strategy trades: the default, as hyperparameters run their defaults. Otherwise
-    a strategy qualifies when its mean yearly return, trading alone as chosen, beats that of SPY held over the same
-    opens (when SPY has no return there the rule cannot apply, and a strategy qualifies on a return of its own). Of
-    the sets of qualifying strategies, the one whose account has the best mean yearly return wins, the larger set
-    first among ties. When none qualifies the set is empty: the account trades nothing. A year at or after
-    `before` raises LeakageError."""
+    a strategy qualifies when its trades beat SPY on those years: trading alone as chosen, its mean yearly return
+    beats that of SPY bought with the same dollars on the same dates, so only the days it had trades open count
+    (when SPY has no return there the rule cannot apply, and a strategy qualifies on a return of its own). Every
+    strategy that qualifies is traded, in the strategies' order; when none does, the account trades nothing. A year
+    at or after `before` raises LeakageError."""
     names, years = list(names), sorted(set(years))
     if before is not None and any(year >= before for year in years):
         raise LeakageError(f"The combination for {before} may use only earlier years; got {years}.")
     if not years:
-        return tuple(names), np.nan, {}
+        return tuple(names), {}
     rows = table[table.year.isin(years)]
     standing = {}
     for name in names:
-        alone = rows[rows.members == json.dumps([name])]
-        mean, spy = _strict_mean(alone.yearly_return), _strict_mean(alone.spy_hold_return)
+        mine = rows[rows.strategy == name]
+        mean, spy = _strict_mean(mine.yearly_return), _strict_mean(mine.spy_mirror_return)
         beats = None if np.isnan(spy) else bool(mean > spy)
-        standing[name] = {"mean_yearly_return": _finite(mean), "spy_hold_mean_return": _finite(spy),
+        standing[name] = {"mean_yearly_return": _finite(mean), "spy_mirror_mean_return": _finite(spy),
                           "beats_spy": beats, "qualifies": bool(np.isfinite(mean)) and beats is not False}
-    sets = _sets([name for name in names if standing[name]["qualifies"]])
-    if not sets:
-        return (), np.nan, standing
-    means = rows.groupby("members").yearly_return.apply(_strict_mean)
-    values = np.array([means.get(json.dumps(list(members)), np.nan) for members in sets], dtype=float)
-    pick = int(np.argmax(np.where(np.isnan(values), -np.inf, values)))  # The first among ties: the larger set.
-    return sets[pick], float(values[pick]), standing
+    return tuple(name for name in names if standing[name]["qualifies"]), standing
 
 
 def chain(ledgers: list[Ledger]) -> tuple[pd.Series, pd.Series]:
@@ -524,53 +575,45 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
     choosing = len(candidates) > len({candidate.model for candidate in candidates})
 
     runs, references, extreme_rows, label_checks, versions, windows = {}, {}, [], {}, {}, {}
+    score_rows, choices = [], {}
     for fold in folds:
+        # Each test year's candidates are chosen on the test years before it only, so the choice is known before the
+        # year trades: only the chosen candidates keep what they traded, the others their score.
+        choices[fold.year] = select(pd.DataFrame(score_rows), candidates,
+                                    [year for year in years if year < fold.year], before=fold.year)
         fitted, label_checks[fold.year] = _fit(specs, config, factories, grids, panel, news, settings,
                                                fold.train_end)
         for candidate in candidates:
             model = fitted[candidate.label]
             versions[candidate.label] = model.version
             windows[candidate.label] = {"horizon_days": model.horizon_days, "bars_lookback": model.bars_lookback,
-                                        "news_lookback_days": model.news_lookback_days,
+                                        "news_lookback_days": model.news_lookback_days, "picks": model.picks,
+                                        "pick_share": getattr(model, "pick_share", None),
                                         "exit": exit_rule(model).as_dict()}
-        year_runs = _trade_year(fold, candidates, fitted, panel, news, settings, config)
+        year_runs = _trade_year(fold, candidates, fitted, panel, news, settings, config,
+                                keep=set(choices[fold.year].values()))
         runs.update({(label, fold.year): run for label, run in year_runs.items()})
+        score_rows += [run.score for run in year_runs.values()]
         rows, references[fold.year] = _universe_scan(fold, [fitted[candidate.label] for candidate in candidates],
                                                      panel, settings, config)
         extreme_rows += rows
-
-    score_rows = []
-    for (label, year), run in runs.items():
-        summary = metrics.ledger_performance(run.ledger.path, run.table)
-        ic = pd.Series([signal["ic"] for signal in run.signals], dtype=float)
-        score_rows.append({
-            "model": run.candidate.model, "candidate": label, "params": json.dumps(dict(run.candidate.params),
-                                                                                  default=str),
-            "year": year, "capital": run.ledger.capital, "profit": float(run.ledger.profit.iloc[-1]),
-            "yearly_return": run.ledger.yearly_return, "daily_return": summary.get("daily_return"),
-            "sharpe": summary.get("sharpe"), "max_drawdown": summary.get("max_drawdown"),
-            "periods": summary.get("periods"), "avg_turnover": summary.get("avg_turnover"),
-            "ic_mean": float(ic.mean()) if ic.notna().any() else np.nan})
     scores = pd.DataFrame(score_rows)
 
-    # Each test year's choice, made on the test years before it only: each model's candidate, then the strategies the
-    # account trades, and the account trading them.
+    # The account in each test year, on that year's choice: the strategies whose trades beat SPY on the years before.
     names = list(config.strategies)
-    choices = {fold.year: select(scores, candidates, [year for year in years if year < fold.year], before=fold.year)
-               for fold in folds}
-    combos = combination_table(names, years, choices, runs, panel, config)
+    against = spy_table(names, years, choices, runs, panel, config)
     accounts, refs, order_tables, fold_rows, traded = {}, {}, [], [], {}
     for fold in folds:
         validation = [year for year in years if year < fold.year]
         chosen = choices[fold.year]
-        members, members_return, standing = choose_combination(combos, names, validation, before=fold.year)
+        members, standing = choose_combination(against, names, validation, before=fold.year)
         traded[fold.year] = members
         every = [runs[chosen[name], fold.year].book for name in names]
         books = [runs[chosen[name], fold.year].book for name in members]
         if books:
             account = basis = trade(panel.sessions, books, config.cost_bps, config.whole_shares, record=True,
                                     capital=config.capital)
-        else:  # No strategy beat SPY: the account stands aside, and the references show the year on every list.
+        else:  # No strategy's trades beat SPY: the account stands aside; the references show the year on every list.
             basis = trade(panel.sessions, every, config.cost_bps, config.whole_shares, capital=config.capital)
             account = idle_ledger(panel.sessions, min(item.start for item in every), max(item.end for item in every),
                                   config.capital)
@@ -581,6 +624,9 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
         if len(account.orders):
             order_tables.append(account.orders.assign(fold=fold.year))
         validation_scores = scores[scores.candidate.isin(chosen.values()) & scores.year.isin(validation)]
+        # The year's account, its chosen candidates trading together, evaluated on the years that chose it: in sample.
+        checked = {str(year): _finite(_account_return(runs, [chosen[name] for name in members], year, panel, config))
+                   for year in validation}
         fold_rows.append({
             "fold": fold.year, "train_end": fold.train_end.date(),
             "validation_years": "-".join(map(str, validation)) if validation else "",
@@ -588,8 +634,11 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
             "chosen": json.dumps({model: dict(by_label[label].params) for model, label in chosen.items()},
                                  default=str),
             "validation_return": json.dumps(validation_scores.groupby("model").yearly_return.mean().to_dict()),
-            "combination": json.dumps(list(members)), "combination_validation_return": _finite(members_return),
-            "against_spy": json.dumps(standing),
+            "combination": json.dumps(list(members)), "against_spy": json.dumps(standing),
+            "account_validation_returns": json.dumps(checked),
+            "account_validation_return": _finite(_strict_mean(checked.values())),
+            "spy_hold_validation_return": _finite(_strict_mean(refs[year]["spy_hold"].yearly_return
+                                                               for year in validation)),
             "account_capital": account.capital, "account_profit": float(account.profit.iloc[-1]),
             "account_return": account.yearly_return,
             "spy_hold_return": refs[fold.year]["spy_hold"].yearly_return,
@@ -600,9 +649,12 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
     # The final choice, made on every test year, for the 2026 test and the API: never traded here. Each model's
     # candidate, then the combination; only the combination's models are fit, since nothing else is served.
     final = select(scores, candidates, years)
-    final_members, final_return, final_standing = choose_combination(combos, names, years)
+    final_members, final_standing = choose_combination(against, names, years)
     for name, standing in final_standing.items():
         standing["in_combination"] = name in final_members
+    # The final choice trading together in every test year, as the account would: in sample, those years chose it.
+    final_account = {str(year): _finite(_account_return(runs, [final[name] for name in final_members], year, panel,
+                                                        config)) for year in years}
     final_models, final_check, final_cutoff = {}, None, None
     if config.final_fit:
         final_cutoff = panel.sessions[-1]
@@ -619,9 +671,11 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
         "capital": config.capital, "order_value": config.order_value, "cost_bps": config.cost_bps,
         "whole_shares": config.whole_shares,
         "min_price": config.min_price, "min_dollar_volume": config.min_dollar_volume, "models": {},
-        # The strategies whose mean yearly return beats SPY held, then the set of them with the best account.
-        "combination": {"models": list(final_members), "chosen_on_years": years,
-                        "mean_yearly_return": _finite(final_return), "strategies": final_standing},
+        # Every strategy whose trades beat SPY bought with the same dollars on the same dates, and the account of
+        # them trading together in each of the years that chose them (in sample).
+        "combination": {"models": list(final_members), "chosen_on_years": years, "strategies": final_standing,
+                        "account_return_by_year": final_account,
+                        "account_mean_yearly_return": _finite(_strict_mean(final_account.values()))},
         # Out of sample: each test year's account, trading the choice made on the years before it.
         "nested_estimate": {"account_return": {str(year): row["account_return"] for year, row in zip(years, fold_rows)},
                             "spy_hold_return": {str(year): row["spy_hold_return"]
@@ -635,7 +689,7 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
         mine = scores[scores.candidate == label].set_index("year").yearly_return
         selection["models"][model] = {
             "params": dict(by_label[label].params), "candidate": label, "version": versions[label],
-            **windows[label], "picks": runs[label, years[-1]].picks, "order_value": config.order_value,
+            **windows[label], "order_value": config.order_value,
             "return_by_year": {str(year): value for year, value in mine.items()},
             "mean_yearly_return": float(mine.mean())}
 
@@ -657,9 +711,9 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
     orders = (pd.concat(order_tables, ignore_index=True) if order_tables
               else pd.DataFrame(columns=[*ORDER_COLUMNS, "fold"]))
 
-    nulls, null_rows = {}, []  # Only for the lists each model trades as chosen.
+    nulls, null_rows = {}, []  # Only for the lists each model trades as chosen, each day as long as its list.
     for name in names:
-        keys = [(year, runs[choices[year][name], year].picks, runs[choices[year][name], year].horizon,
+        keys = [(year, runs[choices[year][name], year].sizes, runs[choices[year][name], year].horizon,
                  runs[choices[year][name], year].rule) for year in years]
         for key in keys:
             if key not in nulls:
@@ -754,4 +808,4 @@ def run_backtest(config: BacktestConfig, factories: dict[str, Callable] = MODELS
     profit = pd.DataFrame({name: chained[name][0] for name in yearly})
     return BacktestResult(config, pd.DataFrame(fold_rows), scores, metric_table, profit, all_periods, position_frame,
                           orders, signals, null, guards, anomalies, selection, versions, final_models,
-                          combinations=combos)
+                          against_spy=against)

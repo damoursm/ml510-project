@@ -61,6 +61,15 @@ class SelectionTest(Store):
             self.assertEqual((selection.chosen_on_years, selection.training_end), ((2025,), "2025-03-31"))
             self.assertEqual(selection.run, folder.resolve().as_posix())
 
+    def test_a_model_that_lists_a_share_of_its_stocks_loads_with_it(self):
+        folder = make_run(self.root, {"flat": replace(small_models(), pick_share=0.1)})
+        edit_selection(folder, lambda selection: selection["models"]["flat"].update(pick_share=0.1))
+        (model,) = load_selection(str(folder)).models
+        self.assertEqual((model.error, model.pick_share, model.models.pick_share), (None, 0.1, 0.1))
+        for share in (0.2, "10%", None):  # Another share, not a share, or none while the pickle lists one.
+            edit_selection(folder, lambda selection: selection["models"]["flat"].update(pick_share=share))
+            self.assertIn("pick_share", load_selection(str(folder)).models[0].error, share)
+
     def test_the_selected_models_rank_as_the_backtest_decides(self):
         """Each loaded model ranks the newest files exactly as recommend() does with the run's filters."""
         noisy = small_models(price=RandomPriceModel(3), version="noise", horizon_days=3)

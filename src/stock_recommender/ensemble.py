@@ -31,6 +31,7 @@ class Ensemble:
     members: tuple  # (Models or Ensemble, weight) pairs.
     normalize: Normalize = "rank"
     picks: int | None = None  # Stocks it recommends buying per decision; defaults to its members' largest.
+    pick_share: float | None = None  # Or, in place of picks, a share of the stocks it ranks (Models.pick_share).
 
     def __post_init__(self):
         if not self.members:

@@ -143,9 +143,9 @@ class NewsBoostTest(unittest.TestCase):
 
     def test_the_registry_holds_it_20_sessions_by_default(self):
         configs = configurations(GRIDS["news_boost"])
-        self.assertEqual(configs[0], {"hold_days": 20, "min_child_samples": 2_000, "num_leaves": 7, "stop_loss": None,
-                                      "take_profit": None, "volatility_exit": None})
-        self.assertEqual(len(configs), 4 * 24)
+        self.assertEqual(configs[0], {"hold_days": 20, "min_child_samples": 2_000, "num_leaves": 7, "picks": 20,
+                                      "stop_loss": None, "take_profit": None, "volatility_exit": None})
+        self.assertEqual(len(configs), 4 * 24 * 5)
         models = build(MODELS["news_boost"], configs[0])
         self.assertIsInstance(models.joint, NewsBoostModel)
         self.assertEqual((models.horizon_days, models.news_lookback_days, models.picks), (20, 90, 20))

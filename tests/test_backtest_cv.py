@@ -1,5 +1,6 @@
-"""The nested walk-forward choice, the account that buys every recommendation for $1,000, its references, and the
-final selection."""
+"""The nested walk-forward choice, the account that buys the recommendations in $100 slices from $10,000, the
+models it trades (those whose trades beat SPY on the same dates), its references, and the final selection."""
+from dataclasses import replace
 import json
 from pathlib import Path
 import pickle
@@ -10,13 +11,13 @@ import pandas as pd
 from stock_recommender.backtest.account import basket, book, hold, mirror, trade
 from stock_recommender.backtest.panel import Panel
 from stock_recommender.backtest.protocol import Period, news_window
-from stock_recommender.backtest.registry import GRIDS, UNTUNED
+from stock_recommender.backtest.registry import GRIDS, UNTUNED, picking
 from stock_recommender.backtest.report import write_run, yearly_table
 from stock_recommender.backtest.run import Candidate, choose_combination, load_data, run_backtest, select
 from stock_recommender.backtest.window import LeakageError, WindowedStore
 from stock_recommender.config import Settings
 from stock_recommender.models import RandomPriceModel
-from stock_recommender.recommend import news_cutoff, score_day
+from stock_recommender.recommend import news_cutoff, pick_count, score_day
 from .backtest_fixtures import (SESSIONS, config, random_walk, small_models, write_bars, write_dividends,
                                 write_news, write_splits)
 
@@ -67,14 +68,24 @@ class NestedTest(unittest.TestCase):
         scores = result.scores.set_index(["candidate", "year"]).yearly_return
         self.assertGreater(scores['oracle{"good": "2025"}', 2025], 0.0)
         self.assertLess(scores['oracle{"good": "2024"}', 2025], 0.0)
+        # 2025's account, the candidate right in 2024, evaluated in 2024: 2024 traded the default, so its lists are
+        # priced again; alone in the account, it earns what it earned alone.
+        self.assertEqual(json.loads(folds.loc[2024, "account_validation_returns"]), {})  # No earlier year.
+        self.assertAlmostEqual(json.loads(folds.loc[2025, "account_validation_returns"])["2024"],
+                               scores['oracle{"good": "2024"}', 2024])
+        final = result.selection["models"]["oracle"]["candidate"]
+        for year, value in result.selection["combination"]["account_return_by_year"].items():
+            self.assertAlmostEqual(value, scores[final, int(year)])
         returns = result.metrics.set_index(["strategy", "scope"]).yearly_return
         self.assertLess(returns["oracle", "2025"], 0.0)  # The choice fails, as it would have live.
         self.assertEqual(result.guards["selection_years"], {"2024": [], "2025": [2024]})
         self.assertEqual(result.selection["chosen_on_years"], [2024, 2025])
 
     def test_the_account_buys_the_chosen_models_lists_from_its_cash(self):
-        factories = {"oracle": lambda: small_models(price=Oracle(self.closes, 2)),
-                     "wrong": lambda: small_models(price=Oracle(self.closes, 2, good="1999"))}
+        closes = self.closes.assign(SPY=400.0)  # SPY stays flat: bought on any dates, it earns nothing.
+        write_bars(self.root / "bars", self.prices["open"].assign(SPY=400.0), closes)
+        factories = {"oracle": lambda: small_models(price=Oracle(closes, 2)),
+                     "wrong": lambda: small_models(price=Oracle(closes, 2, good="1999"))}
         result = run_backtest(config(self.root, models=("oracle", "wrong"), test_years=(2024, 2025)), factories)
         scoped = result.metrics.set_index(["strategy", "scope"])
         folds = result.folds.set_index("fold")
@@ -87,16 +98,20 @@ class NestedTest(unittest.TestCase):
         self.assertAlmostEqual(scoped.yearly_return["account", "2024"],
                                scoped.yearly_return["oracle", "2024"] + scoped.yearly_return["wrong", "2024"])
         self.assertEqual(scoped.capital["account", "2024"], 10_000.0)
-        # 2025 trades the set whose account did best in 2024: the oracle alone, since the wrong model lost. This
-        # data has no SPY, so the rule that a model must beat SPY held cannot apply, and says so.
+        # 2025 trades the models whose trades beat SPY in 2024: the oracle's did; the wrong model lost money, which
+        # SPY bought with the same dollars on the same dates did not.
         self.assertEqual(json.loads(folds.loc[2025, "combination"]), ["oracle"])
         self.assertEqual({name: standing["beats_spy"] for name, standing
-                          in json.loads(folds.loc[2025, "against_spy"]).items()}, {"oracle": None, "wrong": None})
+                          in json.loads(folds.loc[2025, "against_spy"]).items()}, {"oracle": True, "wrong": False})
         self.assertAlmostEqual(scoped.profit["account", "2025"], scoped.profit["oracle", "2025"])
         self.assertGreater(scoped.yearly_return["oracle", "2025"], 0.0)
         self.assertLess(scoped.yearly_return["wrong", "2025"], 0.0)
         filled = result.orders[result.orders.reason == "filled"]
         self.assertTrue(len(filled) and np.allclose(filled.cost, 100.0))  # $100 slices, never scaled.
+        # 2025's account, the oracle alone, evaluated in 2024, which chose it, beside SPY held that year.
+        self.assertAlmostEqual(json.loads(folds.loc[2025, "account_validation_returns"])["2024"],
+                               scoped.yearly_return["oracle", "2024"])
+        self.assertAlmostEqual(folds.loc[2025, "spy_hold_validation_return"], scoped.yearly_return["spy_hold", "2024"])
         self.assertEqual(set(result.orders[result.orders.fold == 2025].model), {"oracle"})
         self.assertEqual(result.profit.account.iloc[-1], scoped.profit["account", "all"])
         self.assertAlmostEqual(folds.loc[2025, "account_return"], scoped.yearly_return["account", "2025"])
@@ -111,12 +126,13 @@ class NestedTest(unittest.TestCase):
         self.assertEqual(result.selection["models"]["oracle"]["order_value"], 100.0)
         self.assertEqual(result.selection["capital"], 10_000.0)
         self.assertFalse(result.selection["final_evaluated"])
-        sets = result.combinations
-        self.assertEqual(len(sets), 3 * 2)  # Three sets of two models, in each of two years.
-        alone = sets[(sets.combination == "oracle") & (sets.year == 2025)].iloc[0]
-        self.assertAlmostEqual(alone.yearly_return, scoped.yearly_return["oracle", "2025"])  # A set of one.
+        against = result.against_spy.set_index(["strategy", "year"])
+        self.assertEqual(len(against), 2 * 2)  # Each model in each of two years.
+        self.assertAlmostEqual(against.yearly_return["oracle", 2025], scoped.yearly_return["oracle", "2025"])
+        self.assertTrue(np.allclose(against.spy_mirror_return, 0.0))  # Flat SPY earns nothing on any dates.
+        self.assertTrue((against.days_with_trades > 0).all())
 
-    def test_only_models_that_beat_holding_spy_enter_the_account(self):
+    def test_only_models_whose_trades_beat_spy_enter_the_account(self):
         def run(spy_end: float):  # SPY's open and close glide from 400 to spy_end over the data.
             spy = 400.0 * np.exp(np.linspace(0.0, np.log(spy_end / 400.0), len(THREE_YEARS)))
             opens = self.prices["open"].assign(SPY=spy)
@@ -127,7 +143,9 @@ class NestedTest(unittest.TestCase):
         falling = run(80.0)  # SPY loses about two thirds of its value in 2024: the random model beats it.
         standing = json.loads(falling.folds.set_index("fold").loc[2025, "against_spy"])["random"]
         self.assertTrue(standing["beats_spy"])
-        self.assertLess(standing["spy_hold_mean_return"], -0.5)
+        # SPY bought with the model's $100 slices on its dates loses money; the model's own picks barely move.
+        self.assertLess(standing["spy_mirror_mean_return"], -0.02)
+        self.assertGreater(standing["mean_yearly_return"], standing["spy_mirror_mean_return"])
         self.assertEqual(falling.selection["nested_estimate"]["combinations"], {"2024": ["random"], "2025": ["random"]})
         self.assertEqual(set(falling.final_models), {"random"})
 
@@ -135,6 +153,7 @@ class NestedTest(unittest.TestCase):
         folds = rising.folds.set_index("fold")
         self.assertFalse(json.loads(folds.loc[2025, "against_spy"])["random"]["beats_spy"])
         self.assertEqual(json.loads(folds.loc[2025, "combination"]), [])
+        self.assertEqual(json.loads(folds.loc[2025, "account_validation_returns"]), {"2024": 0.0})  # Standing aside.
         scoped = rising.metrics.set_index(["strategy", "scope"])
         self.assertEqual((scoped.capital["account", "2025"], scoped.profit["account", "2025"]), (10_000.0, 0.0))
         self.assertEqual(scoped.yearly_return["account", "2025"], 0.0)  # Money left in cash makes nothing.
@@ -150,50 +169,92 @@ class NestedTest(unittest.TestCase):
         self.assertFalse(rising.selection["combination"]["strategies"]["random"]["in_combination"])
         folder = write_run(rising, "test", root=self.root)
         self.assertEqual(json.loads((folder / "selection.json").read_text(encoding="utf-8"))["saved_models"], {})
-        self.assertTrue((folder / "tables" / "combinations.csv").is_file())
+        self.assertTrue((folder / "tables" / "against_spy.csv").is_file())
 
-    def test_the_combination_is_the_best_set_of_models_that_beat_spy_on_earlier_years(self):
-        years, names = [2024, 2025], ["a", "b", "c"]
-        own = {("a",): (0.30, 0.10), ("b",): (0.20, 0.10), ("c",): (0.05, 0.05), ("a", "b"): (0.25, 0.10),
-               ("a", "c"): (0.20, 0.10), ("b", "c"): (0.10, 0.10), ("a", "b", "c"): (0.20, 0.10)}
+    def test_the_account_is_also_evaluated_in_the_years_that_chose_it(self):
+        factories = {"oracle": lambda: small_models(price=Oracle(self.closes, 2)),
+                     "random": lambda: small_models(price=RandomPriceModel(0))}
+        result = run_backtest(config(self.root, models=("oracle", "random"), test_years=(2024, 2025)), factories)
+        folds = result.folds.set_index("fold")
+        scoped = result.metrics.set_index(["strategy", "scope"])
+        # No SPY in this data, so both qualify: 2025's account is both models, as 2024's was, so evaluated in 2024 it
+        # is 2024's account again, the two sharing one $10,000.
+        self.assertEqual(json.loads(folds.loc[2025, "combination"]), ["oracle", "random"])
+        checked = json.loads(folds.loc[2025, "account_validation_returns"])
+        self.assertAlmostEqual(checked["2024"], scoped.yearly_return["account", "2024"])
+        self.assertAlmostEqual(folds.loc[2025, "account_validation_return"], checked["2024"])
+        final = result.selection["combination"]
+        self.assertEqual(final["models"], ["oracle", "random"])
+        self.assertAlmostEqual(final["account_return_by_year"]["2025"], scoped.yearly_return["account", "2025"])
+        self.assertAlmostEqual(final["account_mean_yearly_return"], scoped.mean_yearly_return["account", "all"])
 
-        def table(returns, spy=(0.10, 0.10)) -> pd.DataFrame:
-            return pd.DataFrame([{"members": json.dumps(list(members)), "year": year, "yearly_return": value[i],
-                                  "spy_hold_return": spy[i]}
-                                 for members, value in returns.items() for i, year in enumerate(years)])
+    def test_every_model_whose_trades_beat_spy_on_earlier_years_enters_the_account(self):
+        years, names = [2024, 2025], ["a", "b", "c", "d"]
+        # Per model: its yearly returns trading alone, then SPY's bought with the same dollars on the same dates.
+        own = {"a": ((0.30, 0.10), (0.10, 0.10)), "b": ((0.20, 0.10), (0.12, 0.12)),
+               "c": ((0.05, 0.05), (0.08, 0.04)), "d": ((-0.10, -0.10), (-0.20, -0.20))}
 
-        self.assertEqual(choose_combination(table(own), names, [], before=2024)[0], ("a", "b", "c"))  # The default.
-        members, mean, standing = choose_combination(table(own), names, years)
-        self.assertEqual(members, ("a",))  # a alone (0.20) beats a+b (0.175) and b (0.15).
-        self.assertAlmostEqual(mean, 0.20)
-        self.assertEqual({name: entry["qualifies"] for name, entry in standing.items()},
-                         {"a": True, "b": True, "c": False})  # c's 0.05 is below SPY's 0.10: no set holds it.
-        self.assertAlmostEqual(standing["c"]["spy_hold_mean_return"], 0.10)
+        def table(returns) -> pd.DataFrame:
+            return pd.DataFrame([{"strategy": name, "year": year, "yearly_return": mine[i], "spy_mirror_return": spy[i]}
+                                 for name, (mine, spy) in returns.items() for i, year in enumerate(years)])
+
+        self.assertEqual(choose_combination(table(own), names, [], before=2024)[0], ("a", "b", "c", "d"))  # Default.
+        members, standing = choose_combination(table(own), names, years)
+        # a (0.20 against its SPY's 0.10) and b (0.15 against 0.12) both enter, though a alone did better; d lost
+        # money, but less than SPY did on its dates; c's 0.05 is below its SPY's 0.06.
+        self.assertEqual(members, ("a", "b", "d"))
+        self.assertEqual({name: entry["beats_spy"] for name, entry in standing.items()},
+                         {"a": True, "b": True, "c": False, "d": True})
+        self.assertAlmostEqual(standing["c"]["mean_yearly_return"], 0.05)
+        self.assertAlmostEqual(standing["c"]["spy_mirror_mean_return"], 0.06)
         with self.assertRaises(LeakageError):
             choose_combination(table(own), names, years, before=2025)
-        tied = {**own, ("a",): (0.3, 0.3), ("b",): (0.3, 0.3), ("a", "b"): (0.3, 0.3)}
-        self.assertEqual(choose_combination(table(tied), names, years)[0], ("a", "b"))  # Ties keep the larger set.
-        self.assertEqual(choose_combination(table(own, spy=(0.9, 0.9)), names, years)[0], ())  # None beats SPY.
-        unknown = choose_combination(table(own, spy=(np.nan, 0.10)), names, years)  # No SPY: the rule cannot apply.
-        self.assertEqual((unknown[0], unknown[2]["c"]["beats_spy"], unknown[2]["c"]["qualifies"]), (("a",), None, True))
-        gap = choose_combination(table({**own, ("a",): (np.nan, 0.9)}), names, years)  # A year without a return.
-        self.assertEqual((gap[0], gap[2]["a"]["qualifies"]), (("b",), False))
+        rich = {name: (mine, (0.9, 0.9)) for name, (mine, _) in own.items()}
+        self.assertEqual(choose_combination(table(rich), names, years)[0], ())  # None beats SPY.
+        blind = {name: (mine, (np.nan, np.nan)) for name, (mine, _) in own.items()}  # No SPY: no rule to apply.
+        unknown = choose_combination(table(blind), names, years)
+        self.assertEqual((unknown[0], unknown[1]["c"]["beats_spy"], unknown[1]["c"]["qualifies"]),
+                         (("a", "b", "c", "d"), None, True))
+        gap = choose_combination(table({**own, "a": ((np.nan, 0.9), (0.10, 0.10))}), names, years)  # No return.
+        self.assertEqual((gap[0], gap[1]["a"]["qualifies"]), (("b", "d"), False))
 
-    def test_no_grid_tunes_how_many_stocks_a_model_buys(self):
-        # Every recommended stock is bought for the order value, so picks, which sets the capital, is the model's.
+    def test_a_grid_tunes_how_many_stocks_a_model_trades(self):
+        fits = []
+
+        class Counted(Oracle):
+            def fit(self, data):
+                fits.append(data)
+
+        factories = {"oracle": lambda: small_models(price=Counted(self.closes, 2))}
+        grids = {"oracle": {"picks": (2, 1, "10%")}}  # Its best 2 or 1 stocks, or its best 10%: 3 of the 30.
+        result = run_backtest(config(self.root, models=("oracle",), test_years=(2024, 2025)), factories,
+                              grids=grids)
+        lists = result.scores[result.scores.year == 2024].set_index("candidate").stocks_per_list
+        self.assertEqual(lists.to_dict(), {'oracle{"picks": 2}': 2.0, 'oracle{"picks": 1}': 1.0,
+                                           'oracle{"picks": "10%"}': 3.0})
+        self.assertEqual(len(fits), 2 + 1)  # One fit a year for all three, and the final one.
+        # The oracle earns on every stock it lists, so its 2024 run with the most stocks did best: 2025 trades 3 a day.
+        self.assertEqual(json.loads(result.folds.set_index("fold").loc[2025, "chosen"]), {"oracle": {"picks": "10%"}})
+        listed = result.orders.groupby(["fold", "decision_date"]).size()
+        self.assertEqual((set(listed[2024]), set(listed[2025])), ({2}, {3}))  # 2024 runs the default, 2.
+        self.assertEqual(set(result.signals[result.signals.fold == 2025].picks), {3})
+        self.assertEqual((result.selection["models"]["oracle"]["pick_share"], result.final_models["oracle"].pick_share),
+                         (0.1, 0.1))
+
+    def test_picks_is_a_whole_number_or_a_share_and_never_pick_share(self):
+        self.assertTrue(all("picks" in grid for grid in GRIDS.values()))  # Every registered model tunes it.
         self.assertFalse(any(UNTUNED & set(grid) for grid in GRIDS.values()))
-        for grids in ({"flat": {"picks": (2, 1)}}, {"flat": {"bars_lookback": (3,), "picks": (2,)}}):
+        self.assertEqual(picking(10), {"picks": 10, "pick_share": None})
+        self.assertEqual(picking("0.5%"), {"pick_share": 0.005})
+        self.assertEqual(pick_count(small_models(picks=7), 4676), 7)
+        shared = replace(small_models(picks=7), pick_share=0.01)  # Rounded down, at least one.
+        self.assertEqual([pick_count(shared, ranked) for ranked in (4676, 4700, 648, 50)], [46, 47, 6, 1])
+        for wrong in (0, -1, 2.5, True, "0%", "100%", "x%", "5"):  # Refused before any data is read.
             with self.assertRaisesRegex(ValueError, "picks"):
-                run_backtest(config(self.root), {"flat": small_models}, grids=grids)
-        ensemble = config(self.root, models=(), ensembles=(("mix", (("flat", 1.0),)),))
-        with self.assertRaisesRegex(ValueError, "picks"):  # Nor through an ensemble's members.
-            run_backtest(ensemble, {"flat": small_models}, grids={"flat": {"picks": (2, 1)}})
-        # Nor through a hyperparameter of the model's own that sets picks; refused before any data is read.
-        with self.assertRaisesRegex(ValueError, r"changes picks \(\[2, 5\]\)"):
-            run_backtest(config(self.root / "missing"), {"flat": lambda top=2: small_models(picks=top)},
-                         grids={"flat": {"top": (2, 5)}})
-        run_backtest(config(self.root), {"flat": lambda top=2: small_models(picks=top)},
-                     grids={"flat": {"top": (2,)}})  # One value: picks never changes, so it runs.
+                run_backtest(config(self.root / "missing"), {"flat": small_models},
+                             grids={"flat": {"picks": (wrong,)}})
+        with self.assertRaisesRegex(ValueError, "pick_share"):
+            run_backtest(config(self.root / "missing"), {"flat": small_models}, grids={"flat": {"pick_share": (0.1,)}})
 
     def test_select_never_uses_the_year_it_chooses_for(self):
         scores = pd.DataFrame({"model": "m", "candidate": ["a", "b", "a", "b"], "year": [2024, 2024, 2025, 2025],
@@ -346,6 +407,22 @@ class ReferenceTest(LedgerCase):
         self.assertAlmostEqual(held.yearly_return, 416 / 400 - 1)
         self.assertEqual(list(held.profit.index), list(account.profit.index))
 
+    def test_a_mirror_buys_every_order_whatever_its_own_cash(self):
+        spy = [400.0, 400.0, 300.0, 200.0, 220.0, 240.0] + [240.0] * 14
+        panel = self.panel({"A": [100.0, 100.0, 150.0] + [200.0] * 17, "B": [100.0] * 20, "SPY": spy})
+        lists = [self.listed(["A"], [100]), self.listed(["A", "B"], [200, 100])]
+        item = book(panel, "m", [Period(1, 2), Period(3, 2)], lists, 100.0)
+        (paid,) = trade(panel.sessions, [item], 0.0, capital=150.0).spent
+        self.assertEqual(list(paid), [100.0, 100.0, 100.0])  # A doubled, so its sale pays for both later orders.
+        same = mirror(panel, item, paid)
+        # SPY halved meanwhile: held to its own cash, the mirror could pay for only one of them.
+        short = trade(panel.sessions, [same], 0.0, record=True, capital=150.0)
+        self.assertEqual(list(short.orders.reason), ["filled", "filled", "no_cash"])
+        full = trade(panel.sessions, [same], 0.0, record=True, capital=150.0, cash_limit=False)
+        self.assertEqual(list(full.orders.reason), ["filled"] * 3)
+        self.assertAlmostEqual(full.profit.iloc[-1], 100 * (200 / 400 - 1) + 2 * 100 * (240 / 200 - 1))
+        self.assertAlmostEqual(full.yearly_return, full.profit.iloc[-1] / 150.0)
+
     def test_the_universe_reference_spreads_each_orders_dollars_over_the_universe(self):
         panel = self.panel({"A": [100.0] * 20, "B": [50.0] * 2 + [55.0] * 18, "C": [20.0, np.nan] + [20.0] * 18})
         item = book(panel, "m", [Period(1, 2)], [self.listed(["A"], [100])], 1000.0)
@@ -403,7 +480,7 @@ class OutputTest(unittest.TestCase):
         self.assertFalse(selection["final_evaluated"])
         self.assertEqual(selection["saved_models"], {"flat": "model/flat.pkl"})
         self.assertEqual(pickle.loads((folder / "model/flat.pkl").read_bytes()).picks, 2)
-        for table in ("scores", "folds", "orders", "profit", "yearly", "metrics", "combinations"):
+        for table in ("scores", "folds", "orders", "profit", "yearly", "metrics", "against_spy"):
             self.assertTrue((folder / "tables" / f"{table}.csv").is_file(), table)
         yearly = yearly_table(result).set_index("strategy")
         self.assertEqual(list(yearly.index), ["flat", "account", "spy_hold", "spy_mirror", "universe_ew"])

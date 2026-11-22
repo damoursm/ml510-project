@@ -23,7 +23,9 @@ class Settings:
     sentiment_max_tickers: int = 5  # Articles tagged with more tickers (roundups, lists) are not scored.
     sentiment_workers: int = 4  # Articles sent to Ollama at once.
     score_news: bool = True  # Score the new articles after each refresh's downloads; needs Ollama running.
-    top_n: int = 20  # Stocks in each of the buy and sell lists when the request gives no limit.
+    # Stocks in each of the buy and sell lists when the request gives no limit; None: each served model's own number,
+    # the one its backtest chose (its picks, or its pick_share of the stocks it ranked).
+    top_n: int | None = None
     min_price: float = 5.0  # Last close, in dollars; excludes penny stocks.
     min_dollar_volume: float = 1_000_000.0  # Median daily close * volume over the bars window.
     # Email server, e.g. smtp.gmail.com with an app password, through which the API sends the lists it is asked to.
@@ -59,6 +61,8 @@ class Settings:
                     values[setting.name] = ROOT / raw
                 elif setting.type is bool:  # bool("false") would be True.
                     values[setting.name] = raw.strip().lower() in ("1", "true", "yes", "on")
+                elif setting.type == int | None:  # An empty value is None, e.g. RECOMMENDER_TOP_N= for no fixed size.
+                    values[setting.name] = int(raw) if raw.strip() else None
                 else:
                     values[setting.name] = setting.type(raw)
         return cls(**values)

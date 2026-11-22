@@ -123,19 +123,22 @@ class NewsForestTest(unittest.TestCase):
 
     def test_the_registry_tunes_its_leaves_and_features_on_earlier_years(self):
         configs = configurations(GRIDS["news_forest"])
-        # The defaults run first: the forest's, then the exit strategy's (hold 5 days, no early rule).
-        self.assertEqual(configs[0], {"hold_days": 5, "max_features": 0.5, "min_samples_leaf": 1_000,
+        # The defaults run first: the forest's, the exit strategy's (hold 5 days, no early rule) and its best 20.
+        self.assertEqual(configs[0], {"hold_days": 5, "max_features": 0.5, "min_samples_leaf": 1_000, "picks": 20,
                                       "stop_loss": None, "take_profit": None, "volatility_exit": None})
-        self.assertEqual(len(configs), 4 * 24)  # Two leaf sizes x two feature shares x 24 exit strategies.
+        # Two leaf sizes x two feature shares x 24 exit strategies x 5 list sizes.
+        self.assertEqual(len(configs), 4 * 24 * 5)
         models = [build(MODELS["news_forest"], params) for params in configs]
         self.assertEqual(len({model.version for model in models}), 4)  # Exit settings leave the version.
         self.assertEqual(len({(model.hold_days, model.stop_loss, model.take_profit, model.volatility_exit)
                               for model in models}), 24)
+        self.assertEqual({(model.picks, model.pick_share) for model in models},  # Its best 20, 10 or 5, 0.5% or 1%.
+                         {(20, None), (10, None), (5, None), (20, 0.005), (20, 0.01)})
         for model in models:
             self.assertIsInstance(model.news, NewsForestModel)
             self.assertIsInstance(model.price, PlaceholderPriceModel)  # No bars feature: no move expected.
             self.assertIs(model.blend, news_blend)
-            self.assertEqual((model.horizon_days, model.picks), (5, 20))
+            self.assertEqual(model.horizon_days, 5)
             self.assertGreaterEqual(model.news_lookback_days, NEWS_LOOKBACK_DAYS)  # The features read 7 days.
 
 

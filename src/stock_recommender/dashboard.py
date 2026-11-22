@@ -35,7 +35,7 @@ PROFIT_POINTS = 260  # Most points per line of the profit chart.
 STRATEGIES = {"account": "Account (the picks of the models chosen each year)", "spy_hold": "SPY, held",
               "spy_mirror": "SPY, bought with each order", "universe_ew": "All tradable stocks, equal weight"}
 METRICS = {  # metrics.csv column: (label, format, explanation).
-    "mean_yearly_return": ("Mean yearly return", "signed", "Profit over the capital tied up, averaged over the years"),
+    "mean_yearly_return": ("Mean yearly return", "signed", "Profit over the starting capital, averaged over the years"),
     "sharpe": ("Sharpe", "ratio", "Mean daily return over its standard deviation, annualized"),
     "max_drawdown": ("Max drawdown", "signed", "Largest fall from a peak of the account's value"),
     "period_hit_rate": ("Profitable periods", "share", "Share of holding periods that made money"),
@@ -744,7 +744,7 @@ def _backtest_section(backtest: dict | None) -> str:
                        + "".join(f"<td>{_format(returns.get(year), 'signed')}</td>"
                                  for year in backtest["years"] + ["mean"]) + "</tr>"
                        for strategy, returns in backtest["yearly"].items())
-        parts.append(f'<b>Return each year</b> <span class="meta">(profit over the capital tied up)</span>'
+        parts.append(f'<b>Return each year</b> <span class="meta">(profit over the starting capital)</span>'
                      f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
     if backtest["profit"]:
         parts.append(f'<b>Cumulative profit</b><div class="scroll">{profit_chart(backtest["profit"], names)}</div>')

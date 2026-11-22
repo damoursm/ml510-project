@@ -4,7 +4,8 @@ To plug in trained models, implement PriceModel and NewsModel (predict, and fit 
 them in Models, then return them from load_models() to serve them, and add a factory and its hyperparameter
 grid to backtest/registry.py to backtest them. A model that reads the bars and the news together implements
 JointModel instead, and goes in Models.joint. A decision's output (recommend.score_day) holds the full
-ranking and `trades`, the model's recommended buys: its best `picks` stocks with their price.
+ranking and `trades`, the model's recommended buys: its best `picks` stocks (or its best pick_share of the stocks it
+ranked) with their price.
 With RECOMMENDER_MODEL_RUN set, the API serves a backtest run's final selection instead, the models it pickled
 (served_models.py).
 """
@@ -144,7 +145,7 @@ class Models:
     horizon_days: int
     bars_lookback: int  # Trading days of bars the price model reads.
     news_lookback_days: int  # Calendar days of news the news model reads.
-    picks: int = 20  # Most stocks the model recommends buying at each decision: its best scores.
+    picks: int = 20  # Stocks the model recommends buying at each decision, its best scores, unless pick_share is set.
     # A model that reads the bars and the news together: when set, its prediction is the score, and the blend is
     # not used. Last, with a default, so that bundles pickled before it existed still load (as None).
     joint: JointModel | None = None
@@ -157,6 +158,10 @@ class Models:
     stop_loss: float | None = None
     take_profit: float | None = None
     volatility_exit: float | None = None
+    # In place of picks, the share of the stocks it ranks at a decision that it recommends buying (0.01: its best 1%,
+    # rounded down, at least one; recommend.pick_count). Set by the backtest like picks, never by fitting. A default,
+    # so that bundles pickled before it existed load with None: their picks.
+    pick_share: float | None = None
 
     def fit(self, data: TrainingData) -> None:
         """Train each part that has a fit method, once, on the data before a test period."""

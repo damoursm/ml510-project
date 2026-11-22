@@ -138,6 +138,13 @@ class RecommendationsApiTest(unittest.TestCase):
         self.assertEqual(self.get(limit=10).json()["sell"], [])  # Both tickers are already buys.
         self.assertEqual(self.get(limit=0).status_code, 422)
 
+    def test_without_a_limit_each_list_holds_as_many_stocks_as_the_model_lists(self):
+        self.settings = replace(self.settings, top_n=None)
+        self.assertEqual(len(self.get(replace(load_models(), picks=1)).json()["buy"]), 1)
+        # Its best half of the 2 tradable stocks, whatever its picks.
+        self.assertEqual(len(self.get(replace(load_models(), picks=2, pick_share=0.5)).json()["buy"]), 1)
+        self.assertEqual(len(self.get(replace(load_models(), picks=1), limit=2).json()["buy"]), 2)  # A limit wins.
+
     def test_sell_list_starts_with_the_worst_score(self):
         write_bars(self.settings.bars_dir, "2026-10-16", {"BIG": (100, 1_000), "ACME": (50, 100), "CORE": (20, 500),
                                                           "DUD": (30, 500)})
@@ -168,6 +175,8 @@ class RecommendationsApiTest(unittest.TestCase):
                                                      "RECOMMENDER_BARS_DIR": absolute}):
             settings = Settings.from_env()
         self.assertEqual(settings.top_n, 3)
+        with unittest.mock.patch.dict("os.environ", {"RECOMMENDER_TOP_N": ""}):
+            self.assertIsNone(Settings.from_env().top_n)  # Empty: each served model's own number.
         self.assertEqual(settings.news_dir, ROOT / "elsewhere")  # The download scripts write there too.
         self.assertEqual(settings.bars_dir, Path(absolute))
 

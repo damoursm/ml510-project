@@ -26,9 +26,11 @@ renames, and a halt or delisting at its last close.
 holdings() summarizes one model's ledger per decision: what its orders cost, their profit before and after costs,
 and the turnover at its entry.
 
-The references trade through the same ledger, from the same capital, with fractional shares:
+The references trade through the same ledger, from the same capital, with fractional shares. mirror() and basket()
+spend the account's dollars on its dates, so they buy every one of its orders whatever their own cash
+(trade(cash_limit=False)):
 - mirror(): every order the account filled, spent on one ticker (SPY) instead, on the same dates, early exits
-  included;
+  included; run.choose_combination also compares each model's trades with its own mirror;
 - basket(): the same dollars spread equally over the tradable universe of the order's decision day, held to the
   end of the period whatever the exit rule;
 - hold(): one ticker bought with the whole capital at the account's first entry and held to its last exit.
@@ -180,10 +182,14 @@ def _bought(item: Book, whole_shares: bool) -> tuple[np.ndarray, np.ndarray]:
 
 
 def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_shares: bool = False,
-          record: bool = False, capital: float = CAPITAL) -> Ledger:
+          record: bool = False, capital: float = CAPITAL, cash_limit: bool = True) -> Ledger:
     """Run the account through its books from `capital` in cash, one close at a time: sell the lots that are due,
     then buy the day's lots, the best-ranked first across the books, while the cash covers each (no_cash
-    otherwise), and pay the costs, netted per ticker."""
+    otherwise), and pay the costs, netted per ticker.
+
+    Without the cash limit every lot is bought whatever the cash, which may then go below zero: as a reference that
+    spends another account's dollars on its dates does. Its profit is still its equity minus its capital, which is
+    what its lots earned after costs."""
     rate = cost_bps / 1e4
     start = min(item.start for item in books)
     end = max(item.end for item in books)
@@ -207,7 +213,7 @@ def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_
         into: dict = {}
         for _, b, lot in sorted(entering.get(session, ())):  # Best-ranked first, each book in turn.
             after, _, cost, proceeds, _ = lots[b]
-            if cost[lot] > cash + 1e-9:
+            if cash_limit and cost[lot] > cash + 1e-9:
                 short[b][lot] = True
                 continue
             cash -= cost[lot]

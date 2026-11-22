@@ -5,8 +5,8 @@ fit on all the years before each test year, then trades that year: at every sess
 the stocks and buys its list at that close, from $10,000 (--capital) in $100 slices (--order-value) while the
 cash lasts, and holds each for its hold_days, or sells it earlier when its exit rule fires; sales pay for later
 orders (--back-to-back decides every hold_days sessions instead). The account, the combination model, trades the
-lists of the models chosen for the year (those beating SPY held on the earlier years, then their best set) from
-one capital; a year's return is its last equity over its starting capital, minus 1. SPY held with that capital,
+lists of the models chosen for the year (every model whose trades beat SPY bought with the same dollars on the same
+dates, on the earlier years) from one capital; a year's return is its last equity over its starting capital, minus 1. SPY held with that capital,
 and SPY bought for every order, are the references. A test year's hyperparameters, exit strategies and
 combination are chosen on the test years before it only, by mean yearly return; the first test year runs the
 defaults and every model. The choice made on every test year is saved for the 2026 final test, which this never
@@ -86,7 +86,8 @@ def main():
         result = run_backtest(config)
     except (LeakageError, DataError, ValueError) as error:
         raise SystemExit(f"backtest: {error}")
-    print(result.folds.drop(columns=["validation_return", "against_spy"]).to_string(index=False), "\n")
+    print(result.folds.drop(columns=["validation_return", "against_spy", "account_validation_returns"])
+          .to_string(index=False), "\n")
     print(format_summary(result), "\n")
     print("Final choice for the 2026 test and the API (never evaluated here):")
     print(selection_table(result).to_string(index=False), "\n")
