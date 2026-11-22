@@ -103,10 +103,14 @@ class ForestTest(unittest.TestCase):
 
     def test_the_registry_tunes_its_leaves_and_features_on_earlier_years(self):
         configs = configurations(GRIDS["random_forest"])
-        self.assertEqual(configs[0], {"max_features": 0.5, "min_samples_leaf": 1_000})  # The defaults run first.
-        self.assertEqual(len(configs), 4)
+        # The defaults run first: the forest's, then the exit strategy's (hold 5 days, no early rule).
+        self.assertEqual(configs[0], {"hold_days": 5, "max_features": 0.5, "min_samples_leaf": 1_000,
+                                      "stop_loss": None, "take_profit": None, "volatility_exit": None})
+        self.assertEqual(len(configs), 4 * 24)  # Two leaf sizes x two feature shares x 24 exit strategies.
         models = [build(MODELS["random_forest"], params) for params in configs]
-        self.assertEqual(len({model.version for model in models}), 4)
+        self.assertEqual(len({model.version for model in models}), 4)  # Exit settings leave the version.
+        self.assertEqual(len({(model.hold_days, model.stop_loss, model.take_profit, model.volatility_exit)
+                              for model in models}), 24)
         for model in models:
             self.assertIsInstance(model.price, ForestPriceModel)
             self.assertEqual((model.horizon_days, model.picks), (5, 20))

@@ -46,7 +46,7 @@ class FixedPriceModel:
 class MentionNewsModel:
     """Scores 1 for every ticker in the articles it sees, so the tests can tell which articles it saw."""
 
-    def predict(self, news, tickers):
+    def predict(self, news, tickers, cutoff):
         return pd.Series(1.0, index=news.tickers.explode().unique())
 
 
@@ -118,7 +118,7 @@ class RecommendationsApiTest(unittest.TestCase):
 
     def test_news_model_gets_the_news_columns_when_there_is_no_news(self):
         class TitleNewsModel:
-            def predict(self, news, tickers):
+            def predict(self, news, tickers, cutoff):
                 return pd.Series(len(news.title), index=tickers, dtype=float)
 
         self.settings = replace(self.settings, news_dir=self.settings.news_dir / "missing")

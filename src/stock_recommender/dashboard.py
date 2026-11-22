@@ -32,7 +32,7 @@ HISTORY = 30  # Calls the page lists.
 PROFILE = 5  # A model's strongest drivers shown beside each listed stock.
 SHOWN = 6  # Hovering a stock shows its strongest features by SHAP and by LIME, this many of each.
 PROFIT_POINTS = 260  # Most points per line of the profit chart.
-STRATEGIES = {"account": "Account (every model's picks)", "spy_hold": "SPY, held",
+STRATEGIES = {"account": "Account (the picks of the models chosen each year)", "spy_hold": "SPY, held",
               "spy_mirror": "SPY, bought with each order", "universe_ew": "All tradable stocks, equal weight"}
 METRICS = {  # metrics.csv column: (label, format, explanation).
     "mean_yearly_return": ("Mean yearly return", "signed", "Profit over the capital tied up, averaged over the years"),
@@ -321,6 +321,7 @@ def _lists(body: RecommendationList) -> dict:
     return {"as_of": body.as_of.isoformat(), "news_cutoff": body.news_cutoff.isoformat(),
             "news_through": body.news_through.isoformat() if body.news_through else None,
             "generated_at": body.generated_at.isoformat(), "horizon_days": body.horizon_days,
+            "exits": {name: strategy.summary for name, strategy in body.exits.items()},
             "model_version": body.model_version, "universe_size": body.universe_size, "run": body.run,
             "models": models}
 
@@ -615,8 +616,11 @@ def _summary_line(model: dict) -> str:
 def _lists_section(snapshot: dict) -> str:
     lists, explanation = snapshot["lists"], snapshot["explanation"]
     explained = {model["name"]: model for model in explanation.get("models") or []}
+    exits = lists.get("exits") or {}
+    selling = (f"hold {lists['horizon_days']} trading days" if not exits else next(iter(exits.values()))
+               if len(exits) == 1 else "; ".join(f"{name}: {summary}" for name, summary in exits.items()))
     parts = ['<section id="lists"><h2>Recommendations</h2>',
-             f'<p class="note">To trade at the next open and hold {lists["horizon_days"]} trading days. Beside each stock: '
+             f'<p class="note">To buy at today\'s close (16:00); then {escape(selling)}. Beside each stock: '
              f'its value of the features its model\'s ranking follows most, with its percentile among the '
              f'{lists["universe_size"]:,} tradable stocks (p99: higher than 99% of them). Hover over a stock, or Tab '
              f'to it, for its SHAP and LIME values: how much each feature moves it up or down the ranking.</p>']
@@ -670,8 +674,8 @@ def _drivers_section(snapshot: dict) -> str:
                         + "".join(f'<tr><td class="text">{escape(name)}</td><td>{value:.3f}</td></tr>'
                                   for name, value in ranked) + "</table>")
         else:
-            measured = ('<p class="note">The model measures no importances of its own; a fitted price or news part '
-                        'with a feature_importances() method would list them here.</p>')
+            measured = ('<p class="note">The model measures no importances of its own; a fitted price, news or joint '
+                        'part with a feature_importances() method would list them here.</p>')
         parts.append(f'<h3>{escape(model["name"])} <span class="meta">({model["scored"]:,} stocks scored)</span></h3>'
                      f'<p>{_summary_line(model)}</p>{_surrogate_note(model)}'
                      f'<div class="grid"><div>{driver_chart(model["drivers"])}</div>'
@@ -724,7 +728,7 @@ def _backtest_section(backtest: dict | None) -> str:
     span = f"{years[0]}-{years[-1]}" if years else "the test years"
     names = {**STRATEGIES, **{model: f"{model} (served)" for model in backtest["models"]}}
     parts.append(f'<p class="note">Out of sample, {escape(span)}: each year is traded by models fit on the years '
-                 f'before it, buying every recommended stock for $1,000, from run '
+                 f'before it, from $10,000 a year in $100 slices bought at the 16:00 close, from run '
                  f'<code>{escape(backtest["run"])}</code>. {TEST_YEAR} is reserved for the one final evaluation, so '
                  f'how the recommendations do in {TEST_YEAR} is not shown.</p>')
     if backtest["strategies"]:

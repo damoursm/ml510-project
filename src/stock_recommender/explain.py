@@ -9,7 +9,8 @@ that needs LLM scores is NaN until the articles are scored.
 A model's drivers are the Spearman correlations, across the stocks it scored, between each feature and its ranking:
 +1 when the ranking follows the feature exactly (a higher value ranks higher), -1 when it goes the other way. They
 describe any model, a rule such as most_liquid as well as a fitted one. A model that measures its own importances
-also shows them: a price or news part with a feature_importances() method returning {feature: importance}.
+also shows them: a price, news or joint part with a feature_importances() method returning
+{feature: importance}.
 
 Each listed stock also gets local explanations, SHAP and LIME values: how much each feature moves its rank percentile
 (1 the best stock, 0 the worst) away from the average stock's. The models rank from raw bars and news, not from a
@@ -138,8 +139,8 @@ def correlations(ranked: pd.Index, values: pd.DataFrame) -> list[dict]:
 
 
 def importances(model) -> dict[str, float] | None:
-    """Return the importances a model measures itself, by feature: its price and news parts' feature_importances(),
-    or an ensemble's members' weighted by their weights; None when no part measures any."""
+    """Return the importances a model measures itself, by feature: its price, news and joint parts'
+    feature_importances(), or an ensemble's members' weighted by their weights; None when no part measures any."""
     members = getattr(model, "members", None)
     if members is not None:  # An Ensemble.
         total, weights = {}, sum(weight for _, weight in members) or 1.0
@@ -148,7 +149,7 @@ def importances(model) -> dict[str, float] | None:
                 total[name] = total.get(name, 0.0) + weight / weights * value
         return total or None
     found = {}
-    for part in (getattr(model, "price", None), getattr(model, "news", None)):
+    for part in (getattr(model, "price", None), getattr(model, "news", None), getattr(model, "joint", None)):
         measure = getattr(part, "feature_importances", None)
         if callable(measure):
             for name, value in dict(measure()).items():

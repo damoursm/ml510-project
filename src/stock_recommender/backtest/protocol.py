@@ -1,8 +1,10 @@
 """Walk-forward folds, the trading schedule, and the training data a fold's models may learn from.
 
 Each test year is one fold: models are fit at the close of the last trading day before it, on data through that
-day only, then trade every holding entered during the year. 2021 is for training only, so test years run
-2022..2025. Training labels are purged: a decision's label counts only if its holding ended by the cutoff.
+day only, then trade every holding entered during the year, one a session by default (schedule). A holding is
+decided and bought at the same close, 16:00, when the API's lists come out, and sold at a later close. 2021 is for
+training only, so test years run 2022..2025. Training labels are purged: a decision's label counts only if its
+holding ended by the cutoff.
 """
 from dataclasses import dataclass
 import pandas as pd
@@ -22,16 +24,16 @@ class Fold:
 
 @dataclass(frozen=True)
 class Period:
-    decision: int  # Session index of the decision's close; entry is the next open.
-    holding: int  # Sessions from the entry open to the exit open.
+    decision: int  # Session index of the decision's close (16:00), where the stocks are also bought.
+    holding: int  # Sessions from the entry close to the exit close.
 
     @property
     def entry(self) -> int:
-        return self.decision + 1
+        return self.decision
 
     @property
     def exit(self) -> int:
-        return self.decision + 1 + self.holding
+        return self.decision + self.holding
 
 
 def check_test_years(test_years) -> list[int]:
@@ -59,15 +61,19 @@ def walk_forward(sessions: pd.DatetimeIndex, test_years, refit: bool = True) -> 
     return folds
 
 
-def schedule(sessions: pd.DatetimeIndex, folds: list[Fold], holding: int, offset: int = 0) -> dict[int, list[Period]]:
-    """Return each fold's back-to-back holdings: each exit is the next entry, from the first trading day of the
-    first test year (plus offset) until no full holding fits before the end of the last test year."""
+def schedule(sessions: pd.DatetimeIndex, folds: list[Fold], holding: int, offset: int = 0,
+             every: int | None = None) -> dict[int, list[Period]]:
+    """Return each fold's holdings: one decided, and bought at that close, every `every` sessions, from the first
+    trading day of the first test year (plus offset) until no full holding fits before the end of the last test
+    year. By default every holding is entered as the one before it exits, back to back; with every=1, a decision
+    is made each session and the holdings overlap."""
+    if every is not None and every < 1:
+        raise ValueError(f"Holdings are entered every 1 session or more; got every={every}.")
     first = int(sessions.searchsorted(pd.Timestamp(folds[0].year, 1, 1))) + offset
     last = int(sessions.searchsorted(pd.Timestamp(folds[-1].year + 1, 1, 1))) - 1  # Last session of the last year.
     periods = {fold.year: [] for fold in folds}
-    for entry in range(first, last - holding + 1, holding):
-        year = sessions[entry].year
-        periods[year].append(Period(entry - 1, holding))
+    for decision in range(first, last - holding + 1, holding if every is None else every):
+        periods[sessions[decision].year].append(Period(decision, holding))
     return periods
 
 
@@ -98,7 +104,7 @@ class FoldData:
 
     def labels(self) -> pd.DataFrame:
         if self._labels is None:
-            last = self._cutoff_index - 1 - self.horizon_days  # Purge: the holding must end by the cutoff.
+            last = self._cutoff_index - self.horizon_days  # Purge: the holding must end by the cutoff's close.
             frames = []
             for t in range(self.bars_lookback - 1, last + 1):
                 universe = self._panel.universe(t, self.bars_lookback, self._settings)

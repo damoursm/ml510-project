@@ -2,7 +2,8 @@
 
 To plug in trained models, implement PriceModel and NewsModel (predict, and fit to train in a backtest), bundle
 them in Models, then return them from load_models() to serve them, and add a factory and its hyperparameter
-grid to backtest/registry.py to backtest them. A decision's output (recommend.score_day) holds the full
+grid to backtest/registry.py to backtest them. A model that reads the bars and the news together implements
+JointModel instead, and goes in Models.joint. A decision's output (recommend.score_day) holds the full
 ranking and `trades`, the model's recommended buys: its best `picks` stocks with their price.
 With RECOMMENDER_MODEL_RUN set, the API serves a backtest run's final selection instead, the models it pickled
 (served_models.py).
@@ -25,7 +26,7 @@ class TrainingData(Protocol):
 
     def labels(self) -> pd.DataFrame:
         """Return one row per training decision day and tradable ticker: decision_date, ticker, entry_date,
-        exit_date, forward_return (from the next open, over horizon_days, as the backtest trades it), and
+        exit_date, forward_return (from the decision day's close, over horizon_days, as the backtest trades it), and
         exit_reason. Every exit_date is on or before cutoff."""
 
     def snapshot(self, as_of: pd.Timestamp) -> "Snapshot":
@@ -43,8 +44,8 @@ class TrainingData(Protocol):
 
 @dataclass(frozen=True)
 class Snapshot:
-    """The inputs of one decision: the price model gets bars, the news model gets news."""
-    as_of: pd.Timestamp  # The decision is made at this day's close, to trade at the next open.
+    """The inputs of one decision: the price model gets bars, the news model gets news, a joint model both."""
+    as_of: pd.Timestamp  # The decision is made at this day's close, and its stocks are bought at that close.
     news_cutoff: pd.Timestamp  # 16:00 New York on as_of; news is published before it.
     universe: pd.DataFrame  # Index ticker; close and dollar_volume of the tickers that pass the filters.
     bars: pd.DataFrame  # The universe's bars for the last bars_lookback trading days, split-adjusted as of as_of.
@@ -64,11 +65,25 @@ class PriceModel(Protocol):
 
 
 class NewsModel(Protocol):
-    def predict(self, news: pd.DataFrame, tickers: pd.Index) -> pd.Series:
+    def predict(self, news: pd.DataFrame, tickers: pd.Index, cutoff: pd.Timestamp | None) -> pd.Series:
         """Return each ticker's news sentiment, from -1 (bearish) to 1 (bullish), indexed by ticker.
 
         news holds the articles (scripts/download_news.py columns) published in the news_lookback_days before
-        the news cutoff, the 16:00 New York close of the bars' last day. A ticker left out counts as neutral.
+        cutoff, the news cutoff: the 16:00 New York close of the bars' last day (None without bars). A ticker left
+        out or NaN counts as neutral.
+        """
+
+    def fit(self, data: TrainingData) -> None:
+        """Train on the data before a backtest's test period. Optional: a model without fit is used as is."""
+
+
+class JointModel(Protocol):
+    def predict(self, bars: pd.DataFrame, news: pd.DataFrame, tickers: pd.Index,
+                cutoff: pd.Timestamp | None) -> pd.Series:
+        """Return each ticker's score, higher ranks first, from both its bars and its news, indexed by ticker.
+
+        bars and news are what the price and news models get, and cutoff the decision's news cutoff (None without
+        bars). A ticker left out or NaN is not recommended.
         """
 
     def fit(self, data: TrainingData) -> None:
@@ -91,7 +106,7 @@ class PlaceholderNewsModel:
     def fit(self, data: TrainingData) -> None:
         pass
 
-    def predict(self, news: pd.DataFrame, tickers: pd.Index) -> pd.Series:
+    def predict(self, news: pd.DataFrame, tickers: pd.Index, cutoff: pd.Timestamp | None = None) -> pd.Series:
         return pd.Series(0.0, index=tickers)
 
 
@@ -125,25 +140,46 @@ class Models:
     # (expected_return, news_sentiment) -> score, higher ranks first; both inputs share the scored tickers' index.
     blend: Callable[[pd.Series, pd.Series], pd.Series]
     version: str
-    horizon_days: int  # Trading days a recommended stock is meant to be held.
+    # Trading days of the forward return the models learn, and, unless hold_days says otherwise, a stock is held.
+    horizon_days: int
     bars_lookback: int  # Trading days of bars the price model reads.
     news_lookback_days: int  # Calendar days of news the news model reads.
     picks: int = 20  # Most stocks the model recommends buying at each decision: its best scores.
+    # A model that reads the bars and the news together: when set, its prediction is the score, and the blend is
+    # not used. Last, with a default, so that bundles pickled before it existed still load (as None).
+    joint: JointModel | None = None
+    # The exit strategy (exits.py), set by the backtest like the horizon and never by fitting. A bought stock is
+    # held at most hold_days trading days (None: horizon_days) and sold earlier, at the close
+    # where a rule fires: stop_loss and take_profit are fractions of the entry price (the holding's MAE and MFE
+    # limits), and volatility_exit a multiple of the stock's daily volatility. None turns a rule off. Defaults, so
+    # that bundles pickled before them load without exit rules.
+    hold_days: int | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    volatility_exit: float | None = None
 
     def fit(self, data: TrainingData) -> None:
         """Train each part that has a fit method, once, on the data before a test period."""
-        parts = {id(part): part for part in (self.price, self.news, self.blend)}
+        parts = {id(part): part for part in (self.price, self.news, self.blend, self.joint) if part is not None}
         for part in parts.values():
             if callable(getattr(part, "fit", None)):
                 part.fit(data)
 
     def score(self, bars: pd.DataFrame, news: pd.DataFrame, tickers: pd.Index) -> pd.DataFrame:
-        """Return expected_return, news_sentiment and score for the tickers the price model scores."""
+        """Return expected_return, news_sentiment and score for the tickers the price model scores. The news model
+        and the joint model get the decision's news cutoff: the 16:00 New York close of the bars' last day, as in
+        decision_inputs. With a joint model, the score is its prediction rather than the blend of the other two."""
+        from .recommend import news_cutoff  # recommend imports models; importing here avoids a cycle.
+
+        cutoff = news_cutoff(pd.Timestamp(bars.date.max())) if len(bars) else None
         # Tickers the price model leaves out are dropped before blending, so a fitted blend never sees NaN.
         expected_return = self.price.predict(bars, tickers).reindex(tickers).dropna()
-        sentiment = self.news.predict(news, tickers).reindex(tickers).fillna(0.0)
-        score = pd.Series(self.blend(expected_return, sentiment.reindex(expected_return.index)),
-                          index=expected_return.index)
+        sentiment = self.news.predict(news, tickers, cutoff).reindex(tickers).fillna(0.0)
+        if self.joint is None:
+            score = pd.Series(self.blend(expected_return, sentiment.reindex(expected_return.index)),
+                              index=expected_return.index)
+        else:
+            score = self.joint.predict(bars, news, tickers, cutoff).reindex(expected_return.index)
         return pd.DataFrame({"expected_return": expected_return, "news_sentiment": sentiment,
                              "score": score}).dropna(subset=["expected_return", "score"])
 

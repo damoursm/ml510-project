@@ -46,6 +46,7 @@ class Panel:
     growth: np.ndarray  # sessions x tickers: M * D, the shares (with reinvested payouts) one 2021 share became.
     q_open: np.ndarray  # sessions x tickers: open * M * D where traded, else NaN.
     mark_open: np.ndarray  # What a holding is worth at each open: the open, a renamed ticker's, or the last close.
+    mark_close: np.ndarray  # And at each close: the close, a renamed ticker's, or the last close; NaN before any.
     continued: np.ndarray  # sessions x tickers: valued in the ticker it was renamed to.
     paid_out: np.ndarray  # sessions x tickers: K, large payouts received so far, on the M * D basis.
     total: np.ndarray  # sessions x tickers: M * D with every payout reinvested, for history().
@@ -135,8 +136,8 @@ class Panel:
         mark_open[1:] = np.where(valued[1:], q_open[1:], q_close_ff[:-1])
         rename_table = pd.DataFrame({"old": tickers[renames.old], "new": tickers[renames.new],
                                      "date": sessions[renames.session]})
-        return cls(bars, sessions, tickers, day_starts, traded, multiplier, growth, q_open, mark_open, continued,
-                   paid_out, total, split_audit, dividend_audit, action_audit, rename_table)
+        return cls(bars, sessions, tickers, day_starts, traded, multiplier, growth, q_open, mark_open, q_close_ff,
+                   continued, paid_out, total, split_audit, dividend_audit, action_audit, rename_table)
 
     @staticmethod
     def _multiplier(splits, sessions, tickers, raw_open, raw_close, traded, min_audited):
@@ -274,7 +275,8 @@ class Panel:
         return Panel(bars, pd.DatetimeIndex(self.sessions[:t + 1].to_numpy().copy()),
                      pd.Index(self.tickers[seen].to_numpy().copy(), dtype=object), self.day_starts[:t + 2].copy(),
                      cut(self.traded), cut(self.multiplier), cut(self.growth), cut(self.q_open), cut(self.mark_open),
-                     cut(self.continued), cut(self.paid_out), cut(self.total), empty(self.split_audit),
+                     cut(self.mark_close), cut(self.continued), cut(self.paid_out), cut(self.total),
+                     empty(self.split_audit),
                      empty(self.dividend_audit),
                      empty(self.action_audit), empty(self.renames),
                      {key: value.copy() for key, value in self._universes.items() if key[0] <= t})
@@ -322,15 +324,16 @@ class Panel:
         return self.tickers.get_indexer(pd.Index(tickers))
 
     def forward_returns(self, t: int, holding: int, tickers) -> pd.DataFrame:
-        """Return each ticker's total return from the open after session t to the open `holding` sessions later.
+        """Return each ticker's total return from the close of session t, when it is recommended (16:00), to the
+        close `holding` sessions later.
 
-        A ticker that did not trade at the entry open is not entered (exit_reason no_entry, return NaN). One
-        renamed during the holding is valued in its new ticker (renamed). One that does not trade at the exit
-        open is sold at its last traded close (last_close): a halt or a delisting. entry_price is the open as
-        traded; exit_value is what one share bought then is worth at the exit: after splits, with dividends
-        reinvested and large payouts in cash.
+        A ticker that did not trade on session t is not entered (exit_reason no_entry, return NaN). One renamed
+        during the holding is valued in its new ticker (renamed). One that does not trade on the exit session is
+        sold at its last traded close (last_close): a halt or a delisting. entry_price is the close as traded;
+        exit_value is what one share bought then is worth at the exit: after splits, with dividends reinvested and
+        large payouts in cash (a dividend whose ex-date is session t itself goes to the seller).
         """
-        entry, exit_ = t + 1, t + 1 + holding
+        entry, exit_ = t, t + holding
         if exit_ > len(self.sessions) - 1:
             raise LeakageError(f"A {holding}-day holding decided on {self.sessions[t].date()} would end after "
                                f"{self.sessions[-1].date()}, the last trading day this data may use.")
@@ -341,10 +344,10 @@ class Panel:
         entered = known & self.traded[entry, safe]
         shares = self.growth[entry, safe]
         received = self.paid_out[exit_, safe] - self.paid_out[entry, safe]  # Large payouts during the holding.
-        entry_price = np.where(entered, self.q_open[entry, safe] / shares, np.nan)
-        exit_value = np.where(entered, (self.mark_open[exit_, safe] + received) / shares, np.nan)
+        entry_price = np.where(entered, self.mark_close[entry, safe] / shares, np.nan)
+        exit_value = np.where(entered, (self.mark_close[exit_, safe] + received) / shares, np.nan)
         reason = np.where(~entered, "no_entry", np.where(
-            self.traded[exit_, safe], "open", np.where(self.continued[exit_, safe], "renamed", "last_close")))
+            self.traded[exit_, safe], "close", np.where(self.continued[exit_, safe], "renamed", "last_close")))
         return pd.DataFrame({"entry_date": self.sessions[entry], "exit_date": self.sessions[exit_],
                              "entry_price": entry_price, "exit_value": exit_value,
                              "forward_return": exit_value / entry_price - 1, "exit_reason": reason}, index=tickers)

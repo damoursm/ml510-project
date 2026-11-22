@@ -4,7 +4,7 @@ Run from the repository root, then open http://127.0.0.1:8000/docs:
     python -m uvicorn stock_recommender.api:app --app-dir src
 Keep a single worker process: two would download into the same files at once.
 
-GET /recommendations/latest returns the stocks to buy and sell at the next open. POST to the same path does the
+GET /recommendations/latest returns the stocks to buy and sell at today's close (16:00 New York). POST to the same path does the
 same after optionally fetching new data (fetch=true) and before optionally emailing the lists to the given
 addresses (email=you@example.com). The API runs nothing on its own: every weekday at 16:00 the email task
 (scripts/email_recommendations.py) calls it with both. With RECOMMENDER_MODEL_RUN set, the lists come from that
@@ -22,11 +22,18 @@ from . import __version__, notify
 from .config import Settings
 from .dashboard import Dashboard
 from .data import DataUnavailable, recent_day_files
+from .exits import exit_rule
 from .models import Models, load_models
 from .recommend import Recommendations, buy_and_sell, recommend
 from .refresh import Refresh
-from .schemas import FetchReport, RecommendationList
+from .schemas import ExitStrategy, FetchReport, RecommendationList
 from .served_models import Selection, load_selection
+
+
+def exit_strategy(models) -> ExitStrategy:
+    """A served model's exit strategy, as the lists report it."""
+    rule = exit_rule(models)
+    return ExitStrategy(**rule.as_dict(), summary=rule.describe())
 
 log = logging.getLogger("uvicorn.error")
 
@@ -75,7 +82,8 @@ class LatestRecommendations:
             news_cutoff=result.news_cutoff.to_pydatetime(),
             news_through=result.news_through.to_pydatetime() if result.news_through is not None else None,
             generated_at=generated_at,
-            horizon_days=self.models.horizon_days,
+            horizon_days=exit_rule(self.models).hold_days,
+            exits={self.models.version: exit_strategy(self.models)},
             model_version=self.models.version,
             universe_size=result.universe_size,
             buy=buy.to_dict("records"),
@@ -156,7 +164,8 @@ class RunRecommendations(LatestRecommendations):
             news_cutoff=first.news_cutoff.to_pydatetime(),
             news_through=max(throughs).to_pydatetime() if throughs else None,
             generated_at=generated_at,
-            horizon_days=max(model.horizon_days for model in served),
+            horizon_days=max(exit_rule(model.models).hold_days for model in served),
+            exits={model.name: exit_strategy(model.models) for model in served},
             model_version=" + ".join(dict.fromkeys(model.version for model in served)),
             universe_size=max(result.universe_size for _, result in results),
             buy=buy,
@@ -230,7 +239,7 @@ def create_app(settings: Settings | None = None, models: Models | None = None) -
 
     @app.get("/recommendations/latest", response_model=RecommendationList)
     def latest_recommendations(background: BackgroundTasks, limit: int = limit_query) -> RecommendationList:
-        """Return the stocks to buy and sell at the next open, from the data on disk."""
+        """Return the stocks to buy and sell at today's close, from the data on disk."""
         try:
             body = latest.lists(limit)
         except HTTPException as error:

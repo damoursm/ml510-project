@@ -132,9 +132,9 @@ class WindowGuardTest(Store):
         data = load_data(config(self.root))
         panel = data[1]
         last = len(panel.sessions) - 1
-        panel.forward_returns(last - 3, 2, ["T000"])  # Exit on the last session: allowed.
+        panel.forward_returns(last - 2, 2, ["T000"])  # Bought at a close, sold at the last session's: allowed.
         with self.assertRaises(LeakageError):
-            panel.forward_returns(last - 2, 2, ["T000"])
+            panel.forward_returns(last - 1, 2, ["T000"])
         result = run_backtest(config(self.root), {"flat": small_models}, data)
         self.assertLessEqual(result.periods.exit_date.max(), panel.sessions[-1])
         self.assertLessEqual(result.periods.exit_date.max(), pd.Timestamp("2025-12-31"))
@@ -226,16 +226,17 @@ class PointInTimeTest(unittest.TestCase):
             "C": [100.0] * 5 + [50.0, 55.0] + [55.0] * (n - 7),  # 2-for-1 on the entry day: 50 -> 55, +10%.
         }, [("A", str(self.sessions[6].date()), 1, 2), ("B", str(self.sessions[6].date()), 10, 1),
             ("C", str(self.sessions[5].date()), 1, 2)])
-        returns = panel.forward_returns(3, 3, ["A", "B"]).forward_return  # Entry session 4, exit session 7.
+        returns = panel.forward_returns(3, 3, ["A", "B"]).forward_return  # Session 3's close to session 6's.
         self.assertAlmostEqual(returns["A"], 0.02)
         self.assertAlmostEqual(returns["B"], 0.05)
-        self.assertAlmostEqual(panel.forward_returns(4, 1, ["C"]).forward_return["C"], 0.10)
+        self.assertAlmostEqual(panel.forward_returns(5, 1, ["C"]).forward_return["C"], 0.10)  # Bought at 50.
+        self.assertAlmostEqual(panel.forward_returns(4, 2, ["C"]).forward_return["C"], 0.10)  # At 100, before.
 
     def test_a_missing_exit_sells_at_the_last_close_and_a_missing_entry_is_not_bought(self):
         n = 30
         panel = self.panel({"D": [10.0] * 6 + [np.nan] * (n - 6), "E": [10.0] * n},
                            volumes={"D": [1000.0] * n, "E": [1000.0] * 4 + [0.0] + [1000.0] * (n - 5)})
-        returns = panel.forward_returns(3, 4, ["D", "E", "NOPE"])  # Entry session 4, exit session 8.
+        returns = panel.forward_returns(4, 4, ["D", "E", "NOPE"])  # Session 4's close to session 8's.
         self.assertEqual(returns.exit_reason.to_dict(), {"D": "last_close", "E": "no_entry", "NOPE": "no_entry"})
         self.assertEqual(returns.forward_return["D"], 0.0)
         self.assertTrue(np.isnan(returns.forward_return["E"]))
@@ -273,8 +274,8 @@ class ProtocolTest(Store):
         labels = data.labels()
         self.assertLessEqual(labels.exit_date.max(), cutoff)
         self.assertEqual(labels.decision_date.min(), panel.sessions[2])  # The first day with 3 sessions of bars.
-        self.assertEqual(labels.decision_date.max(), panel.sessions[37])  # Purged: its holding ends at the cutoff.
-        expected = self.prices["open"].iloc[39] / self.prices["open"].iloc[37] - 1
+        self.assertEqual(labels.decision_date.max(), panel.sessions[38])  # Purged: its holding ends at the cutoff.
+        expected = self.prices["close"].iloc[38] / self.prices["close"].iloc[36] - 1  # Close to close.
         row = labels[(labels.decision_date == panel.sessions[36]) & (labels.ticker == "T005")]
         self.assertAlmostEqual(row.forward_return.iloc[0], expected["T005"])
         self.assertEqual(data.bars().date.max(), cutoff)
@@ -334,7 +335,7 @@ class EngineTest(Store):
     tickers = 60
 
     def test_leakage_canary(self):
-        opens = self.prices["open"]
+        closes = self.prices["close"]
         holding = 2
 
         class Momentum:
@@ -344,13 +345,14 @@ class EngineTest(Store):
 
         class Oracle:  # Test-only: knows the future, to show the engine would reward it.
             def predict(self, bars, tickers):
-                t = opens.index.get_loc(bars.date.max())
-                realized = opens.iloc[t + 1 + holding] / opens.iloc[t + 1] - 1
+                t = closes.index.get_loc(bars.date.max())
+                realized = closes.iloc[t + holding] / closes.iloc[t] - 1  # Bought at this close.
                 return realized.reindex(tickers)
 
+        # $1,000 slices: five stocks a day held two sessions keep the whole $10,000 at work.
         result = self.run_backtest({"momentum": lambda: small_models(price=Momentum(), picks=5),
                                     "oracle": lambda: small_models(price=Oracle(), picks=5)},
-                                   models=("momentum", "oracle"))
+                                   models=("momentum", "oracle"), order_value=1_000.0)
         ic = result.signals.groupby("strategy").ic.mean()
         self.assertLess(abs(ic["momentum"]), 0.1)  # Only past bars: no edge on a random walk.
         self.assertGreater(ic["oracle"], 0.95)
@@ -361,7 +363,8 @@ class EngineTest(Store):
     def test_the_backtest_ranks_exactly_as_the_api(self):
         store, panel, news = load_data(config(self.root))
         settings = Settings(min_price=0, min_dollar_volume=0)
-        models = small_models(price=FixedPriceModel({f"T{i:03d}": (i % 7) / 100 for i in range(self.tickers)}))
+        models = small_models(price=FixedPriceModel({f"T{i:03d}": (i % 7) / 100 for i in range(self.tickers)}),
+                              bars_lookback=21)  # Enough sessions for the 20 moves of the daily volatility.
         t = 25
         backtest = score_day(panel.window(t, models.bars_lookback), news_window(news, news_cutoff(panel.sessions[t]), 7),
                              panel.sessions[t], settings, models)
@@ -371,24 +374,30 @@ class EngineTest(Store):
             (api_dir / str(day.year)).mkdir(parents=True, exist_ok=True)
             shutil.copy(source, api_dir / str(day.year) / source.name)
         api = recommend(replace(settings, bars_dir=api_dir, news_dir=self.root / "news"), models)
-        pd.testing.assert_frame_equal(backtest.table, api.table)
+        # The API also shows each stock's daily volatility, for a volatility_exit rule; it ranks nothing.
+        pd.testing.assert_frame_equal(backtest.table, api.table.drop(columns="daily_volatility"))
         self.assertEqual((backtest.as_of, backtest.universe_size), (api.as_of, api.universe_size))
+        closes = self.prices["close"].iloc[:t + 1]
+        expected = closes.iloc[-21:].pct_change(fill_method=None).iloc[1:].std(ddof=1)
+        np.testing.assert_allclose(api.table.set_index("ticker").daily_volatility.sort_index(),
+                                   expected.reindex(api.table.ticker).sort_index())
 
     def test_ledger_formulas(self):
         store, panel, _ = load_data(config(self.root))
-        opens = self.prices["open"]
+        closes = self.prices["close"]
         periods = [Period(10, 2), Period(12, 2)]
         lists = [pd.DataFrame({"ticker": [ticker], "price": [50.0]}) for ticker in ("T000", "T001")]
         ledger = trade(panel.sessions, [book(panel, "m", periods, lists, 1000.0)], cost_bps=10, record=True)
-        a = opens["T000"].iloc[13] / opens["T000"].iloc[11]
-        b = opens["T001"].iloc[15] / opens["T001"].iloc[13]
-        # Buy T000; sell it and buy T001 at the same open; sell T001 at the end: 10 bps of each.
+        a = closes["T000"].iloc[12] / closes["T000"].iloc[10]
+        b = closes["T001"].iloc[14] / closes["T001"].iloc[12]
+        # Buy T000 at session 10's close; sell it and buy T001 at 12's; sell T001 at 14's: 10 bps of each.
         fees = [0.001 * 1000, 0.001 * (1000 * a + 1000), 0.001 * 1000 * b]
         self.assertAlmostEqual(ledger.profit.iloc[-1], 1000 * (a - 1) + 1000 * (b - 1) - sum(fees))
-        self.assertEqual(ledger.profit.index[0], panel.sessions[11])
-        self.assertEqual(ledger.profit.index[-1], panel.sessions[15])
-        mid = 1000 * (opens["T000"].iloc[12] / opens["T000"].iloc[11] - 1) - fees[0]
-        self.assertAlmostEqual(ledger.profit[panel.sessions[12]], mid)
+        self.assertEqual(ledger.profit.index[0], panel.sessions[10])
+        self.assertEqual(ledger.profit.index[-1], panel.sessions[14])
+        mid = 1000 * (closes["T000"].iloc[11] / closes["T000"].iloc[10] - 1) - fees[0]
+        self.assertAlmostEqual(ledger.profit[panel.sessions[11]], mid)
+        self.assertAlmostEqual(ledger.yearly_return, ledger.profit.iloc[-1] / 10_000)  # On the starting cash.
         table = holdings(ledger, periods, panel.sessions)
         self.assertEqual(list(table.columns), HOLDING_COLUMNS)
         np.testing.assert_allclose(table.turnover, [1.0, a + 1])  # Bought all; then sold all and bought all.
@@ -411,7 +420,7 @@ class EngineTest(Store):
         self.assertEqual(len(first), 2)  # picks=2 with constant scores: the two most liquid tickers.
         filled = flat[flat.reason == "filled"]
         np.testing.assert_allclose(filled.forward_return, filled.exit_value / filled.cost - 1)
-        self.assertTrue(set(filled.exit_reason) <= {"open", "renamed", "last_close"})
+        self.assertTrue(set(filled.exit_reason) <= {"close", "renamed", "last_close"})
         held = result.periods[result.periods.strategy == "flat"]
         self.assertTrue(set(HOLDING_COLUMNS) <= set(held.columns))
         self.assertAlmostEqual(held.net_profit.sum(), result.profit.flat.iloc[-1])  # Every cost is a holding's.
@@ -524,13 +533,13 @@ class ReviewFindingsTest(Store):
 
     def test_turnover_counts_only_what_changes_hands(self):
         store, panel, _ = load_data(config(self.root))
-        opens = self.prices["open"]
+        closes = self.prices["close"]
         both = pd.DataFrame({"ticker": ["T000", "T001"], "price": [50.0, 50.0]})
         periods = [Period(10, 2), Period(12, 2)]
         ledger = trade(panel.sessions, [book(panel, "m", periods, [both, both], 1000.0)], 0.0, record=True)
-        a = opens["T000"].iloc[13] / opens["T000"].iloc[11]
-        b = opens["T001"].iloc[13] / opens["T001"].iloc[11]
-        # Each stock is sold at its value and bought back for $1,000 at the same open: only the difference trades.
+        a = closes["T000"].iloc[12] / closes["T000"].iloc[10]
+        b = closes["T001"].iloc[12] / closes["T001"].iloc[10]
+        # Each stock is sold at its value and bought back for $1,000 at the same close: only the difference trades.
         self.assertAlmostEqual(holdings(ledger, periods, panel.sessions).turnover.iloc[1],
                                (abs(1000 * a - 1000) + abs(1000 * b - 1000)) / 2000)
 
@@ -692,10 +701,10 @@ class CorporateEventsTest(unittest.TestCase):
         self.assertEqual(panel.dividend_audit.set_index("ticker").loc["OLD"].rekeyed_from, "NEW")
         self.assertEqual(panel.split_audit.set_index("ticker").loc["OLD"].rekeyed_from, "NEW")
         self.assertTrue(panel.dividend_audit.set_index("ticker").loc["OLD"].applied)
-        returns = panel.forward_returns(27, 4, ["OLD"])  # Entry session 28, exit session 32 (NEW's 22.0).
+        returns = panel.forward_returns(28, 4, ["OLD"])  # Session 28's close (10.0) to 32's (NEW's 11.0).
         self.assertEqual(returns.exit_reason["OLD"], "renamed")
         self.assertAlmostEqual(returns.forward_return["OLD"], 11.0 / 10.0 - 1)
-        across_split = panel.forward_returns(17, 4, ["OLD"])  # Entry 18 at 20, exit 22 at 10 after the 2:1.
+        across_split = panel.forward_returns(18, 4, ["OLD"])  # Bought at 20, sold at 10 after the 2:1.
         self.assertAlmostEqual(across_split.forward_return["OLD"], 0.0)
 
     def test_an_event_listed_under_both_tickers_counts_once(self):

@@ -65,17 +65,33 @@ def information_coefficient(scores: pd.Series, returns: pd.Series, minimum: int 
     return float(both.iloc[:, 0].rank().corr(both.iloc[:, 1].rank()))
 
 
+def _independent(rows: pd.DataFrame) -> float:
+    """How many independent observations the decisions are: each counts min(every, holding) / holding, from its
+    `every` (sessions to the next decision) and `holding` columns; 1 each without them."""
+    if not len(rows):
+        return 0.0
+    holding = rows["holding"].to_numpy(dtype=float) if "holding" in rows else np.ones(len(rows))
+    every = rows["every"].to_numpy(dtype=float) if "every" in rows else holding
+    return float(np.sum(np.minimum(every, holding) / holding))
+
+
 def signal_summary(signals: pd.DataFrame) -> dict:
     """Summarize per-decision information coefficients and buy-minus-sell spreads.
 
-    Holdings do not overlap, so each decision is one independent observation for the t-statistics.
+    A decision's forward return spans its holding (the signal's `holding` column, in sessions; 1 when absent).
+    Decisions closer together than that share sessions, as the daily decisions do, so each counts as `every /
+    holding` of an independent observation for the t-statistics, where `every` is the sessions to the next one
+    (at most the holding): back-to-back decisions count 1 each, daily ones of a 5-session holding 1/5.
     """
     result = {}
     for column in ("ic", "spread"):
-        values = signals[column].dropna() if column in signals else pd.Series(dtype=float)
+        rows = signals[signals[column].notna()] if column in signals else signals.iloc[:0]
+        values = rows[column] if column in rows else pd.Series(dtype=float)
         mean, std = values.mean(), values.std(ddof=1)
+        observations = _independent(rows)
         result[f"{column}_mean"] = float(mean) if len(values) else np.nan
-        result[f"{column}_t"] = float(mean / std * np.sqrt(len(values))) if len(values) > 1 and std > 0 else np.nan
+        result[f"{column}_t"] = (float(mean / std * np.sqrt(observations)) if len(values) > 1 and std > 0
+                                 else np.nan)
         result[f"{column}_days"] = int(len(values))
     result["ic_positive_share"] = float((signals.ic.dropna() > 0).mean()) if signals.ic.notna().any() else np.nan
     return result

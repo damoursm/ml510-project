@@ -173,7 +173,7 @@ class RunEmailTest(unittest.TestCase):
         text = message.get_body(("plain",)).get_content()
         self.assertEqual((sent["buy"], sent["sell"]), (body["buy"], body["sell"]))
         self.assertEqual(message["Subject"], "Stock recommendations as of 2026-10-16: 1 buy, 1 sell")
-        self.assertIn(f"Model fixed from backtest run {body['run']}, 5-day horizon.", text)
+        self.assertIn(f"Model fixed from backtest run {body['run']}. Exit: hold 5 trading days.", text)
         self.assertEqual(([item["ticker"] for item in body["buy"]], [item["ticker"] for item in body["sell"]]),
                          (["BIG"], ["DUD"]))
         bought, sold = text.split("\nSELL\n")

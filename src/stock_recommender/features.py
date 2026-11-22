@@ -70,14 +70,22 @@ def _scatter(rows: np.ndarray, columns: np.ndarray, values: list[np.ndarray], sh
     return arrays
 
 
+_decided = None  # The newest (bars, features): a day's models read one snapshot's bars (recommend.rank).
+
+
 def decision_features(bars: pd.DataFrame) -> pd.DataFrame:
     """Return the features, indexed by ticker, of each ticker that has a bar on the last day of a bars window.
 
     bars has columns date, ticker, open, high, low, close and volume, split-adjusted as of its last day (as
-    Snapshot.bars and the API's downloaded bars are), and a bar for every trading day a ticker traded.
+    Snapshot.bars and the API's downloaded bars are), and a bar for every trading day a ticker traded. The
+    features of the newest bars table are kept, so the models deciding on the same snapshot compute them once.
     """
+    global _decided
     if bars.empty:
         return pd.DataFrame(columns=FEATURES, index=pd.Index([], dtype=object, name="ticker"), dtype=np.float64)
+    held = _decided
+    if held is not None and held[0] is bars:  # Held, so its id cannot be another table's.
+        return held[1].copy()
     days = pd.DatetimeIndex(np.sort(bars.date.unique()))[-LOOKBACK:]
     window = bars[bars.date >= days[0]]
     names = window.ticker.astype(str)
@@ -86,7 +94,9 @@ def decision_features(bars: pd.DataFrame) -> pd.DataFrame:
     keep = columns >= 0
     values = [window[name].to_numpy(dtype=np.float64)[keep] for name in PRICES + ["volume"]]
     arrays = compute(*_scatter(rows[keep], columns[keep], values, (len(days), len(tickers))))
-    return pd.DataFrame({name: arrays[name][-1] for name in FEATURES}, index=tickers)
+    features = pd.DataFrame({name: arrays[name][-1] for name in FEATURES}, index=tickers)
+    _decided = (bars, features)
+    return features.copy()
 
 
 def training_features(data) -> pd.DataFrame:

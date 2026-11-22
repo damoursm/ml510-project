@@ -4,7 +4,7 @@ fit(data) learns from a backtest fold's training data (models.TrainingData) how 
 compares with the day's other stocks, from its features on the decision day:
 - Rows: one decision day in every horizon_days sessions, counted back from the last labelled day, so that the
   holdings never overlap and nearly identical consecutive days do not count horizon_days times.
-- Target: the forward return the backtest trades (from the next open, over horizon_days), minus that day's mean over
+- Target: the forward return the backtest trades (from the decision's 16:00 close, over horizon_days), minus that day's mean over
   the tradable stocks, clipped at its `clip` and 1 - `clip` quantiles over the rows. The forest learns the order of
   the stocks rather than the market's move, and a few stocks that double or collapse do not steer every tree.
 - Missing features (a recent listing, a halt) stay NaN: scikit-learn's forests split on them.

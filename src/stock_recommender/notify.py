@@ -17,15 +17,24 @@ def cells(item: Recommendation) -> list[str]:
             f"{item.news_sentiment:+.2f}", str(item.news_count), f"{item.close:,.2f}"]
 
 
+def exit_text(body: RecommendationList) -> str:
+    """When to sell what the lists buy: each model's exit strategy in words, named when there are several."""
+    if not body.exits:
+        return f"hold {body.horizon_days} trading days"
+    if len(body.exits) == 1:
+        return next(iter(body.exits.values())).summary
+    return "; ".join(f"{name}: {strategy.summary}" for name, strategy in body.exits.items())
+
+
 def compose(body: RecommendationList, sender: str, recipients: list[str]) -> EmailMessage:
     """Return a message listing the buys and sells, as plain text and as HTML tables."""
     # A served backtest run is named, and with several models each row says whose it is.
     source = f" from backtest run {body.run}" if body.run else ""
     several = len({item.model for item in body.buy + body.sell}) > 1
     headers = HEADERS[:1] + ["Model"] + HEADERS[1:] if several else HEADERS
-    intro = (f"Stocks to buy and sell at the next open, from bars through {body.as_of} and news published "
-             f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}{source}, "
-             f"{body.horizon_days}-day horizon.")
+    intro = (f"Stocks to buy and sell at today's close (16:00 New York), from bars through {body.as_of} and news published "
+             f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}{source}. "
+             f"Exit: {exit_text(body)}.")
     text, html = [intro], [f"<p>{escape(intro)}</p>"]
     if body.fetch and body.fetch.errors:  # The lists come from the older data still on disk.
         warning = "Warning: fetching new data failed, so these lists may be stale: " + "; ".join(body.fetch.errors)

@@ -1,13 +1,16 @@
 """Backtest models with a nested walk-forward on 2021-2025 data, never 2026, and report their yearly returns.
 
-Every model candidate (a model with one set of hyperparameters, from backtest/registry.py) is fit on all the years
-before each test year, then trades that year: it ranks the stocks at a session's close, buys every stock on its
-list for the order value ($1,000) at the next open, and holds it for its horizon, back to back. The account, the
-combination model, starts at $0 and buys every model's list the same way; a year's return is its profit over its
-capital, the most its open orders cost at one time. SPY held with that capital, and SPY bought for every order,
-are the references. A test year's hyperparameters are chosen on the test years before it only, by mean yearly
-return; the first test year runs the defaults. The choice made on every test year is saved for the 2026 final
-test, which this never runs. Results go to artifacts/<label>/.
+Every model candidate (a model with one set of hyperparameters and an exit strategy, from backtest/registry.py) is
+fit on all the years before each test year, then trades that year: at every session's close (16:00) it ranks
+the stocks and buys its list at that close, from $10,000 (--capital) in $100 slices (--order-value) while the
+cash lasts, and holds each for its hold_days, or sells it earlier when its exit rule fires; sales pay for later
+orders (--back-to-back decides every hold_days sessions instead). The account, the combination model, trades the
+lists of the models chosen for the year (those beating SPY held on the earlier years, then their best set) from
+one capital; a year's return is its last equity over its starting capital, minus 1. SPY held with that capital,
+and SPY bought for every order, are the references. A test year's hyperparameters, exit strategies and
+combination are chosen on the test years before it only, by mean yearly return; the first test year runs the
+defaults and every model. The choice made on every test year is saved for the 2026 final test, which this never
+runs, and the API serves it. Results go to artifacts/<label>/.
 
 Needs the as-traded bars, splits and dividends (2021-2025 only), downloaded once:
   python scripts/download_daily_bars.py --unadjusted --start 2021-01-01 --end 2025-12-31 --out data/raw/polygon/daily_bars_unadjusted
@@ -52,9 +55,16 @@ def main():
                         help="Consecutive years within 2022-2025. Each is traded by models trained on all earlier "
                              "years, with hyperparameters chosen on the test years before it.")
     parser.add_argument("--offset", type=int, default=defaults.offset, help="Sessions to delay each year's first entry.")
+    parser.add_argument("--decide-every", type=int, default=defaults.decide_every,
+                        help="Sessions between a model's decisions; 1, the default, decides and buys every session, "
+                             "each stock sold by its model's exit strategy.")
+    parser.add_argument("--back-to-back", action="store_true",
+                        help="Decide every hold_days sessions instead, each holding entered as the last one exits.")
     parser.add_argument("--cost-bps", type=float, default=defaults.cost_bps, help="Per side, on the value traded.")
+    parser.add_argument("--capital", type=float, default=defaults.capital,
+                        help="The cash every test year starts with; stocks are bought only while it lasts.")
     parser.add_argument("--order-value", type=float, default=defaults.order_value,
-                        help="Dollars spent on every recommended stock, each order funded anew.")
+                        help="The slice of the cash each recommended stock is bought for.")
     parser.add_argument("--whole-shares", action="store_true",
                         help="Buy whole shares only (rounded down from the list price); default fractional.")
     parser.add_argument("--no-final-fit", action="store_true", help="Skip fitting the final choice on 2021-2025.")
@@ -67,16 +77,18 @@ def main():
     try:
         config = BacktestConfig(
             models=tuple(args.models), ensembles=tuple(args.ensemble or ()), normalize=args.normalize,
-            test_years=tuple(args.test_years), offset=args.offset, cost_bps=args.cost_bps,
-            order_value=args.order_value, whole_shares=args.whole_shares, final_fit=not args.no_final_fit,
+            test_years=tuple(args.test_years), offset=args.offset,
+            decide_every=None if args.back_to_back else args.decide_every, cost_bps=args.cost_bps,
+            capital=args.capital, order_value=args.order_value, whole_shares=args.whole_shares,
+            final_fit=not args.no_final_fit,
             min_price=args.min_price, min_dollar_volume=args.min_dollar_volume, null_seeds=args.null_seeds)
         started = time.monotonic()
         result = run_backtest(config)
     except (LeakageError, DataError, ValueError) as error:
         raise SystemExit(f"backtest: {error}")
-    print(result.folds.drop(columns=["validation_return"]).to_string(index=False), "\n")
+    print(result.folds.drop(columns=["validation_return", "against_spy"]).to_string(index=False), "\n")
     print(format_summary(result), "\n")
-    print("Final choice for the 2026 test (never evaluated here):")
+    print("Final choice for the 2026 test and the API (never evaluated here):")
     print(selection_table(result).to_string(index=False), "\n")
     guards = result.guards
     print(f"Read {guards['files_opened']} files dated {guards['first_file_day']}..{guards['last_file_day']}, "

@@ -78,7 +78,7 @@ class SelectionTest(Store):
 
     def test_a_bad_selection_is_an_error_not_an_exception(self):
         model = small_models()
-        for fields in ({"final_evaluated": True}, {"training_end": "2026-01-05"}, {"chosen_on_years": [2026]}):
+        for fields in ({"training_end": "2026-01-05"}, {"chosen_on_years": [2026]}, {"chosen_on_years": [2021, 2022]}):
             selection = load_selection(str(make_run(self.root, {"flat": model}, **fields)))
             self.assertTrue(selection.error, fields)
             self.assertEqual((selection.models, selection.loaded), ((), ()), fields)
@@ -91,6 +91,12 @@ class SelectionTest(Store):
         self.assertIn("RECOMMENDER_MODEL_RUN is empty", load_selection("").error)
         (folder / "selection.json").write_text("{", encoding="utf-8")
         self.assertIn("cannot read", load_selection(str(folder)).error)
+
+    def test_the_choice_the_final_test_evaluated_is_still_served(self):
+        # The 2026 test measures the combination the API serves; it does not retire it.
+        selection = load_selection(str(make_run(self.root, {"flat": small_models()}, final_evaluated=True)))
+        self.assertIsNone(selection.error)
+        self.assertEqual([model.name for model in selection.loaded], ["flat"])
 
     def test_a_model_that_does_not_load_is_left_out(self):
         good, other = small_models(), small_models(horizon_days=3, version="other")

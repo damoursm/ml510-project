@@ -3,11 +3,16 @@ from dataclasses import replace
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from stock_recommender import sentiment
 from stock_recommender.backtest.run import BacktestConfig
 from stock_recommender.data import NEWS_COLUMNS
 from stock_recommender.models import placeholder_models
 
 SESSIONS = pd.bdate_range("2024-11-01", "2025-03-31")  # Weekdays: tests do not need exchange holidays.
+# The news market (write_news_market): 2024 trains the 2025 fold, with 60 sessions of history before it.
+NEWS_SESSIONS = pd.bdate_range("2023-11-01", "2025-03-31")
+NEWS_NAMES = [f"T{i:03d}" for i in range(30)]
+GOOD, BAD, QUIET = NEWS_NAMES[:10], NEWS_NAMES[10:20], NEWS_NAMES[20:]  # Good news and rising, bad and falling, none.
 
 
 def small_models(**changes):
@@ -98,3 +103,29 @@ def config(root: Path, **changes) -> BacktestConfig:
                     dividends_path=None,
                     actions_path=None, changes_path=None)
     return BacktestConfig(**(defaults | changes))
+
+
+def write_news_market(root: Path) -> None:
+    """Write random walks where the stocks with good news drift up and those with bad news drift down, every news
+    stock gets an article each session, scored by the LLM 9 times in 10, and the quiet stocks get none; the
+    sentiment files go to root / "sentiment"."""
+    prices = random_walk(len(NEWS_NAMES), NEWS_SESSIONS, seed=7)
+    drift = np.array([0.003 if name in GOOD else -0.003 if name in BAD else 0.0 for name in NEWS_NAMES])
+    growth = np.exp(np.outer(np.arange(len(NEWS_SESSIONS)), drift))
+    write_bars(root / "bars", prices["open"] * growth, prices["close"] * growth)
+    write_splits(root / "splits.parquet", [])
+    write_news(root / "news", [(f"{day.date()}T14:00:00Z", [name]) for day in NEWS_SESSIONS for name in GOOD + BAD])
+    rng = np.random.default_rng(8)
+    rows = []
+    for path in sorted((root / "news").rglob("*.parquet")):
+        for item in pd.read_parquet(path).itertuples():
+            ticker = str(item.tickers[0])
+            if rng.random() < 0.1:
+                continue  # Not scored, as when the LLM's answer was malformed.
+            sign = 1 if ticker in GOOD else -1
+            rows.append({"id": item.id, "published_utc": item.published_utc, "ticker": ticker, "event": "other",
+                         "relevance": 2, "impact": 1, "sentiment": sign * int(rng.integers(1, 3)),
+                         "model": "qwen3:8b", "prompt_version": sentiment.PROMPT_VERSION})
+    frame = sentiment.to_frame(rows)
+    for day, group in frame.groupby(frame.published_utc.dt.date):
+        sentiment.write_day(group, root / "sentiment" / str(day.year) / f"{day}.parquet")

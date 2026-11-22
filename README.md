@@ -18,7 +18,7 @@ requirements.txt   Shared pinned course dependencies
 
 ## Recommendations API
 
-`src/stock_recommender` serves the stocks to buy and to sell at the next open, ranked by models run on the
+`src/stock_recommender` serves the stocks to buy and to sell at today's close (16:00 New York), ranked by models run on the
 downloaded daily bars and news: the best combination of models from a backtest run (see *The served models*), or,
 until one is set, the placeholders of `stock_recommender/models.py` (`load_models`). Download the history once, then
 start the API:
@@ -67,8 +67,11 @@ changes by itself.
 - **Ranking.** Each selected model ranks the stocks from the newest files through the backtest's decision path
   (`score_day`). It uses the pickle the run saved (never refit), and the run's price and dollar-volume filters and news
   inputs.
-- **Lists.** They hold each model's top `limit` buys and worst `limit` sells. Each item carries its `model`, `run`
-  names the run, and `model_version` joins the models' versions.
+- **Lists.** They hold each model's top `limit` buys and worst `limit` sells. Each item carries its `model` and its
+  `daily_volatility`, `run` names the run, and `model_version` joins the models' versions.
+- **When to sell.** `exits` gives each model's exit strategy, and the email states it: hold at most `hold_days`
+  trading days, and sell earlier at a close where a rule fires (see *Exit strategy* below).
+  `horizon_days` is the longest hold among the models.
 - **Health.** `/health` shows whether each model loaded. If none loads, the API answers 503 and the error goes to
   `logs/api.log`.
 
@@ -137,8 +140,9 @@ The **Recommendations** tab:
   - `explain.py` computes both, without the shap or lime packages.
 - **What drives each model's ranking.** For each of the ten price features (`features.py`) and the eight news features
   (`news_features.py`), the Spearman correlation between the feature and the model's ranking, across the stocks it
-  scored (`explain.py`). This describes any model, a rule such as `most_liquid` as well as a fitted one. A price or news
-  part with a `feature_importances()` method returning `{feature: importance}` also shows the importances it measures.
+  scored (`explain.py`). This describes any model, a rule such as `most_liquid` as well as a fitted one. A price, news
+  or joint part with a `feature_importances()` method returning `{feature: importance}` also shows the importances it
+  measures.
   The news features that read LLM scores stay n/a until the day's articles are scored.
 - **Calls.** The latest calls, with their result, fetch and email: a count, never the addresses.
 
@@ -277,9 +281,10 @@ still look better than live trading; late 2025 and the 2026 final test are clean
 ## Backtesting (2021-2025 only)
 
 `src/stock_recommender/backtest` replays the API's own decisions over history to measure the yearly return of
-each model, and of the account: the combination model, which starts at $0 and buys every stock every model
-recommends for $1,000. It uses 2021-2025 data only and never anything from 2026, which is reserved for the
-final test:
+each model, and of the account: the combination model, which starts every test year with $10,000 and buys the
+stocks recommended by the models chosen for the year in $100 slices, at the 16:00 close of the day they are
+recommended, while its cash lasts. It uses 2021-2025 data only and never anything from 2026, which is reserved
+for the final test:
 - the bounds are constants;
 - only the 2021..2025 folders are listed;
 - every row read is checked against its file's day;
@@ -303,31 +308,74 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
   - That run is out of sample, and serves both as the year's test run and as validation for later years.
   - **Hyperparameters**: for test year T, each model runs its candidate with the best mean yearly return
     over the test years before T. The first test year has no earlier year, so it runs the defaults (each
-    grid's first values). Nothing that sizes the money is tuned: every order is $1,000, and how many stocks a
-    model recommends (`picks`) is the model's own.
-  - **Final choice**: the choice made on every test year 2022-2025 is saved for the 2026 test, together with
-    models fit on all of 2021-2025. It is never evaluated here.
-- **Model output**: at a session's close each model ranks the tradable stocks exactly as the API does, on its
-  own bar window. Its recommendations (`score_day(...).trades`) are its best `picks` stocks with their price,
-  the decision-day close.
-- **Trading: $1,000 per recommended stock, from $0.** Each model, and the account that combines them, buys
-  every stock on a list for `--order-value` ($1,000) at the next open and sells it at the open
-  `horizon_days` later, when the next holding starts. Holdings stay inside each test year.
-  - **The account, the combination model**: every backtested model's list, each model on its own horizon.
-    With one model, the account is that model.
-  - **No cash limit, nothing reinvested**: each order is funded with new money, so no order is ever scaled
-    down, and what one trade earns or loses never changes another.
-  - **Return**: a year's profit over its capital, the most the open orders cost at one time ($20,000 for 20
-    picks). A year's mean daily return, volatility, Sharpe and drawdown are measured on that capital too.
-    Over several years, each year counts as funded anew: the yearly returns are averaged, and the profits
-    added up.
-  - **Shares**: fractional, so each order buys exactly $1,000 at the open. With `--whole-shares` the share
-    count is rounded down from the list price, and a stock priced above $1,000 is skipped.
-  - **Costs**: netted per ticker at each open, so a stock sold and bought back at the same open pays only on
-    the difference.
+    grid's first values). Nothing that sizes the money is tuned: the capital and the $100 slice are fixed, and
+    how many stocks a model recommends (`picks`) is the model's own.
+  - **Exit strategy**: every model's settings include when its stocks are sold (`stock_recommender/exits.py`),
+    tuned with its other hyperparameters. Each is a `Models` field, and every grid in `backtest/registry.py` tries
+    these values (the first is the default, as before exit settings existed):
+    - `hold_days` (5, 10 or 20): the most trading days a stock is held. `horizon_days`, the return the forests
+      learn, stays 5.
+    - `stop_loss` (off or 8%): sell at a close this far below the entry price, when the holding's maximum
+      adverse excursion (MAE) reaches it.
+    - `take_profit` (off or 15%): sell after a close this far above it, when its maximum favorable excursion (MFE)
+      reaches it.
+    - `volatility_exit` (off or 3): after a close-to-close move of at least 3 times the stock's daily volatility
+      (its standard deviation over the 20 sessions through the decision day), sell once a move is back within one
+      times it: the volatility the event provoked has settled.
+
+    The rules read closes, never intraday prices, and sell at the close where they fire (16:00, when the lists
+    come out). A rule firing only at the scheduled exit's close changes nothing, and a stop wins a tie.
+    Candidates that differ only in their exit strategy share one fit and one ranking per day, so these 24
+    strategies cost trading time, not training. `positions.csv` records
+    each order's excursions (`mfe`, `mae`, at the closes while held) and the rule that sold it (`exit_reason`).
+  - **Combination**: for test year T, the account trades a set of the models (and ensembles), chosen on the
+    test years before T like the hyperparameters (`choose_combination` in `backtest/run.py`):
+    - A model qualifies only when its mean yearly return, trading alone as chosen, beats SPY held over the same
+      closes. (Data without SPY cannot apply this rule, and every model then qualifies; `folds.csv` says so.)
+    - Of the sets of qualifying models, the one whose account had the best mean yearly return wins; the larger set
+      wins a tie. A set trades from the one $10,000: while the cash lasts its models' profits add up, so adding a
+      profitable model helps; once the cash runs short, the models compete for the slices, best-ranked first.
+    - The first test year has no earlier year, so it trades every model. A year where no model qualifies trades
+      nothing: the account's return is 0 that year, as for money left in cash, and the references show the year on
+      every model's lists.
+  - **Final choice**: the same choices made on all of 2022-2025 (each model's hyperparameters, then the
+    combination) are saved for the 2026 test, with the combination's models fit on all of 2021-2025. This is what
+    the API serves; it is never evaluated here. When no model beats SPY, nothing is saved and the API has nothing
+    to serve.
+- **Model output**: at every session's close each model ranks the tradable stocks exactly as the API's daily
+  lists do, on its own bar window. Its recommendations (`rank(...).trades`) are its best `picks` stocks with their
+  price, the decision-day close. The models deciding on a day share one snapshot of the inputs, so the price and
+  news features are computed once for all of them.
+- **Trading: $10,000 a test year, $100 per recommended stock, at 16:00, every session.** Each model, and the
+  account that combines them, starts each test year with `--capital` ($10,000) in cash and works one close at
+  a time (`account.trade`):
+  - It first sells the lots that are due: at the close `hold_days` sessions after their purchase, or earlier at
+    the close where their exit rule fires. The proceeds return to the cash and pay for later orders.
+  - It then buys the day's list at that same close, the moment the recommendation is made, one
+    `--order-value` slice ($100) per stock, best-ranked first, while the cash covers a slice; a stock it cannot
+    pay for is skipped (`no_cash` in `orders.csv`). With several models, they take turns: each one's best
+    stock, then each one's second... A stock listed again while held is bought again, as its own lot.
+  - The cash limits how much is held: $10,000 in $100 slices is 100 lots, which 20 picks a day held 5 sessions
+    fill exactly; a longer hold runs out of cash and skips stocks until sales bring it back.
+  - A year's last entries are those whose `hold_days` still fit in it. `--decide-every N` decides every N
+    sessions instead, and `--back-to-back` every `hold_days` sessions.
+  - **Live**, the lists come out at 16:00 from the day's close, so a stock is bought at that close: with an
+    order placed just before the close or in after-hours trading. The backtest decides on the close it then
+    trades at, a mild look-ahead, and does not model after-hours spreads.
+  - **The account, the combination model**: the lists of the models chosen for the year (see *Combination*),
+    from the one capital, each model on its own horizon. Each model is also reported trading alone, from its
+    own $10,000, whether the account traded it or not.
+  - **Return**: a year's last equity (cash plus the lots still open) over its starting capital, minus 1:
+    (equity - 10,000) / 10,000. Money left in cash earns nothing. A year's mean daily return, volatility,
+    Sharpe and drawdown are measured on the starting capital too. Over several years, each year starts afresh
+    from $10,000: the yearly returns are averaged, and the profits added up.
+  - **Shares**: fractional, so each order buys exactly its slice at the close. With `--whole-shares` the share
+    count is rounded down from the price, and a stock priced above the slice is skipped.
+  - **Costs**: netted per ticker at each close, so a stock sold and bought back at the same close pays only on
+    the difference; they are paid from the cash.
   - **Dividends**: a lot's dividends are reinvested in the lot rather than paid out as cash.
-- **References**, with the account's money, fractional shares and the same costs:
-  - `spy_hold`: SPY bought with the account's capital at its first entry and held to its last exit;
+- **References**, from the same capital, with fractional shares and the same costs:
+  - `spy_hold`: SPY bought with all the capital at the account's first entry and held to its last exit;
   - `spy_mirror`: SPY bought for every order the account filled, with the same dollars and dates;
   - `universe_ew`: the same dollars spread equally over the tradable universe of each order's decision day.
 - **Costs and returns**: costs are 5 bps per side (`--cost-bps`). Returns are total returns: dividends (converted to dollars when paid in
@@ -346,9 +394,10 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
   - No choice for a year sees that year or a later one: `select()` raises `LeakageError` otherwise.
   - Only the targets (training labels, realized returns, metrics) look ahead.
 - **Models**: `--models` lists the models to backtest, by default every model in `backtest/registry.py`;
-  `--ensemble NAME=MODEL:W,MODEL:W` adds a model that blends others' rank-normalized scores. There are two models:
-  - `most_liquid` expects no move for any stock, so it buys the 20 most liquid ones. It has no hyperparameters, so
-    nothing is tuned for it.
+  `--ensemble NAME=MODEL:W,MODEL:W` adds a model that blends others' rank-normalized scores. There are five models,
+  each also tuning its exit strategy:
+  - `most_liquid` expects no move for any stock, so it buys the 20 most liquid ones. It has no hyperparameters of
+    its own.
   - `random_forest` (`stock_recommender/forest.py`) is a random forest on the ten daily-bar features below, with no
     news. It learns each stock's 5-session forward return minus the day's average over the tradable stocks,
     clipped at the 1st and 99th percentiles, so it learns the order of the stocks rather than the market's move. It
@@ -356,11 +405,40 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
     Its grid tunes the stocks a leaf averages at least (`min_samples_leaf`: 1,000 by default, or 250) and the share
     of the features each split tries (`max_features`: 0.5 by default, or 1.0). Its own feature importances show on
     the dashboard.
+  - `news_forest` (`stock_recommender/news_forest.py`) is a random forest on the eight news features above, with
+    no daily-bar feature: its price model expects no move for any stock, and it ranks on its news model alone. It
+    learns from, and rates, only the stocks with at least one article in the last 7 days; a stock without news
+    counts as neutral. Its target is the 5-session forward return as a percentile rank among all of that day's
+    tradable stocks, scaled to -1 to 1 (0 is the average stock), so its output reads like a sentiment. A rank
+    rather than the return keeps a few volatile stocks from steering it, as they steered `random_forest`. Like
+    `random_forest`, it trains on one decision day in every 5 sessions, buys its 20 best ratings, and tunes the
+    same grid. Its own feature importances show on the dashboard.
+  - `price_news_forest` (`stock_recommender/price_news_forest.py`) is one random forest on the ten daily-bar
+    features and the eight news features together, so that its trees can weigh a stock's news by what its price
+    did. It learns from, and rates, every tradable stock: a stock without news in the last 7 days has news counts
+    of 0 and its other news features missing, which the trees can tell apart from neutral news. It learns the rank
+    target of `news_forest`. Like the other forests, it trains on one decision day in every 5 sessions, buys its
+    20 best ratings, and tunes the same grid. It is a joint model: it gives the score itself, so its lists show an
+    expected return and a sentiment of 0. Its own feature importances show on the dashboard.
+  - `news_boost` (`stock_recommender/news_boost.py`) is LightGBM on 55 news features (`EXTENDED_NEWS_FEATURES` in
+    `news_features.py`): the eight above, the same measures over 3, 14 and 30 days, the 90-day article count and
+    the 7-day count's surprise against it, the spread and shares of the week's sentiment, focused articles (at most
+    2 tickers tagged), press-release wires against other publishers, Polygon's own sentiment labels (from mid-2024
+    only), and the sentiment and count of each event kind. It reads 90 days of news. It learns the 20-session
+    forward return as `news_forest`'s scaled rank, from the stocks with news in the 7 days, preferred shares
+    excluded, on one decision day in every 5 sessions; it is a joint model that rates only those stocks, so its 20
+    picks are always stocks it rated. Its grid tunes `num_leaves` (7 or 15) and `min_child_samples` (2,000 or 500),
+    and its exit strategy holds 20 sessions by default. It came out of a news-model research of 2021-2025 data
+    (every 5th session, nested walk-forward): on 20-session returns its daily IC was about 0.02, positive in each
+    test year, against 0.005 for `news_forest`'s forest on 8 features over 5 sessions.
 
   To add a model, implement `fit` and `predict` (see `stock_recommender/models.py`), then register a factory
-  and its grid in `backtest/registry.py`. A grid can name the model's own hyperparameters, and also
-  `horizon_days` or `bars_lookback`, but not `picks`: a model sets how many stocks it recommends itself, and
-  the backtest refuses a grid that tunes it.
+  and its grid in `backtest/registry.py`. A news model's `predict(news, tickers, cutoff)` also gets the decision's
+  news cutoff: the 16:00 New York close of the bars' last day. A model that reads both the bars and the news goes in
+  `Models.joint`: its `predict(bars, news, tickers, cutoff)` gives the score, in place of the blend of the price and
+  news models' outputs. A grid can name the model's own hyperparameters, the exit settings (add `**EXITS` to
+  try the shared ones), and also `horizon_days` or `bars_lookback`, but not `picks`: a model sets how many stocks
+  it recommends itself, and the backtest refuses a grid that tunes it.
 
   `stock_recommender/features.py` has ten features from the daily bars for a price model such as a random forest:
   returns over 1, 5 and 20 sessions, momentum over 60 sessions without the last week, the overnight gap, where the
@@ -374,17 +452,24 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
     and their mean.
   - `metrics.csv`: per test year and over all of them, the capital, profit, return, daily return, volatility,
     Sharpe, drawdown, turnover, IC, the comparison with each reference, and with random lists of the same
-    size.
+    size. Daily decisions share sessions with their neighbours, so the IC and spread t-statistics count each
+    as 1/`hold_days` of an independent observation.
   - `scores.csv`: every candidate in every year, which is what the choices read.
-  - `folds.csv`: what was chosen for each test year, on which years, and the account's capital, profit and
+  - `combinations.csv`: every set of models trading together in every year, each as chosen, beside SPY held
+    over the same opens, which is what the combination reads (a set of one is the model alone).
+  - `folds.csv`: what was chosen for each test year, on which years: each model's hyperparameters, the models
+    the account traded, how each model's mean return compared with SPY's, and the account's capital, profit and
     return beside SPY's.
   - `orders.csv`: every account order, with the reason it was filled or skipped.
   - `periods.csv` and `positions.csv`: each model as chosen, trading alone; per holding period, what its orders
     cost, its profit before and after costs, and its turnover (the dollars traded at its entry over the dollars
-    invested); and every order it placed, with its return and how it exited.
-  - `profit.csv` and `figures/profit.png`: each strategy's profit at every open, from $0, test years added up.
-  - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test. This is what the API serves
-    once `RECOMMENDER_MODEL_RUN` names the run; a model that does not pickle cannot be served.
+    invested); and every order it placed, with its return, how it exited (`exit_reason`: at the end of its
+    holding, or the exit rule that sold it) and its excursions (`mfe`, `mae`).
+  - `profit.csv` and `figures/profit.png`: each strategy's profit at every close, test years added up.
+  - `selection.json` and `model/<name>.pkl`: the final choice for the 2026 test: the combination's models with
+    their exit strategies (`exit`), and under `combination` how every model compared with SPY. This is what the
+    API serves once
+    `RECOMMENDER_MODEL_RUN` names the run; a model that does not pickle cannot be served.
   - Also: `signals.csv`, `null.csv`, `anomalies.csv`, and `guards.json` (the files read, the last date of every
     input, the years behind each choice, and `final_evaluated: false`).
 

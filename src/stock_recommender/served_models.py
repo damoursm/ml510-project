@@ -15,10 +15,12 @@ import pickle
 import re
 from .backtest.window import FIRST_DAY
 from .config import ROOT, Settings
+from .exits import exit_rule
 from .recommend import Recommendations, recommend
 
 TEST_YEAR = 2026  # The reserved final test: a served selection was chosen and fit on the years before it.
-DECISION_PATH = ("recommend.py", "models.py", "data.py", "ensemble.py")  # /health lists those changed since the run.
+# /health lists those changed since the run.
+DECISION_PATH = ("recommend.py", "models.py", "data.py", "ensemble.py", "exits.py")
 SIZES = ("horizon_days", "bars_lookback", "news_lookback_days", "picks")
 MODEL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
@@ -120,6 +122,10 @@ def _load_model(folder: Path, name, entry, saved) -> SelectedModel:
         for key in ("version", *SIZES):  # Duck typing: an Ensemble passes too.
             if getattr(loaded, key) != getattr(model, key):
                 raise ValueError(f"its {key} is {getattr(loaded, key)!r}, not the selection's {getattr(model, key)!r}")
+        # Runs saved before exit settings existed record none; their models hold for their horizon.
+        expected = entry.get("exit")
+        if expected is not None and exit_rule(loaded).as_dict() != expected:
+            raise ValueError(f"its exit strategy is {exit_rule(loaded).as_dict()}, not the selection's {expected}")
     except Exception as error:  # Missing, truncated, unimportable or another model: only this one is unavailable.
         return replace(model, error=f"{saved}: {type(error).__name__}: {error}")
     return replace(model, sha256=hashlib.sha256(content).hexdigest(), models=loaded)
@@ -157,9 +163,9 @@ def load_selection(spec: str) -> Selection:
         sources = manifest.get("source_sha256") or {}
     except Exception as error:
         return replace(blank, error=f"cannot read the selection of {run} ({type(error).__name__}: {error}).")
+    # A served run was chosen on test years within 2022-2025 and fit on data before 2026. The 2026 final test measures
+    # that same choice, so a run it evaluated is still served.
     problems = []
-    if selection.get("final_evaluated") is not False:
-        problems.append("its final_evaluated is not false")
     if not (isinstance(known.training_end, str) and known.training_end < f"{TEST_YEAR}-01-01"):
         problems.append(f"its models were fit through {known.training_end}, not before {TEST_YEAR}")
     allowed = range(FIRST_DAY.year + 1, TEST_YEAR)

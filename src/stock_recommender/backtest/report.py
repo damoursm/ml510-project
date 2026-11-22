@@ -48,11 +48,31 @@ def yearly_table(result: BacktestResult) -> pd.DataFrame:
 
 
 def selection_table(result: BacktestResult) -> pd.DataFrame:
-    """Return the final choice for the 2026 test: each model's hyperparameters and order value."""
+    """Return the final choice for the 2026 test: each model of the combination, its hyperparameters, its exit
+    strategy and order value."""
+    columns = ["model", "params", "picks", "horizon_days", "hold_days", "stop_loss", "take_profit", "volatility_exit",
+               "order_value", "mean_yearly_return"]
     return pd.DataFrame([{"model": name, "params": json.dumps(choice["params"]), "picks": choice["picks"],
-                          "horizon_days": choice["horizon_days"], "order_value": choice["order_value"],
-                          "mean_yearly_return": choice["mean_yearly_return"]}
-                         for name, choice in result.selection["models"].items()])
+                          "horizon_days": choice["horizon_days"], **(choice.get("exit") or {}),
+                          "order_value": choice["order_value"], "mean_yearly_return": choice["mean_yearly_return"]}
+                         for name, choice in result.selection["models"].items()], columns=columns)
+
+
+def combination_summary(result: BacktestResult) -> str:
+    """Say which strategies the account traded in each test year, chosen on the test years before it, and which the
+    final choice keeps for the 2026 test and the API."""
+    def named(members) -> str:
+        return ", ".join(members) if members else "nothing (no model beat holding SPY)"
+
+    lines = []
+    for row in result.folds.itertuples():
+        basis = f"chosen on {row.validation_years}" if row.validation_years else "every model: no earlier test year"
+        lines.append(f"  {row.fold}: {named(json.loads(row.combination))} ({basis})")
+    final = result.selection.get("combination") or {}
+    years = final.get("chosen_on_years") or []
+    lines.append(f"  2026 test and the API: {named(final.get('models') or [])} (chosen on "
+                 f"{'-'.join(map(str, years)) or 'no year'})")
+    return "\n".join(lines)
 
 
 def _percent(digits: int):
@@ -75,11 +95,13 @@ def format_summary(result: BacktestResult) -> str:
     for column in years.columns[1:]:
         years[column] = years[column].map(_percent(1))
     return (f"{table.to_string(index=False)}\n\nReturn per test year (profit over capital, "
-            f"${result.config.order_value:,.0f} per order):\n{years.to_string(index=False)}")
+            f"${result.config.order_value:,.0f} per order):\n{years.to_string(index=False)}\n\n"
+            f"Models the account traded (only those whose mean yearly return beat SPY held qualify; then the set of "
+            f"them with the best account):\n{combination_summary(result)}")
 
 
 def profit_figure(result: BacktestResult):
-    """Plot each strategy's and reference's profit at every open, from $0, test years added up."""
+    """Plot each strategy's and reference's profit at every close, from its starting capital, test years added up."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -103,7 +125,7 @@ def profit_figure(result: BacktestResult):
     axis.set_title(f"Profit from \\$0 at \\${result.config.order_value:,.0f} per order, test years added up, out of "
                    f"sample {result.config.test_years[0]}-{result.config.test_years[-1]}", loc="left", color=INK,
                    fontsize=12)
-    axis.set_ylabel("Profit at the open (\\$)", color=INK_SECONDARY)
+    axis.set_ylabel("Profit at the close (\\$)", color=INK_SECONDARY)
     legend = axis.legend(frameon=False, loc="upper left", ncols=min(len(columns), 4))
     for text in legend.get_texts():
         text.set_color(INK)
@@ -127,6 +149,7 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
     run.save_table("yearly", yearly_table(result))
     run.save_table("metrics", result.metrics)
     run.save_table("scores", result.scores)
+    run.save_table("combinations", result.combinations)
     run.save_table("profit", result.profit.rename_axis("date"), index=True)
     run.save_table("folds", result.folds)
     run.save_table("orders", result.orders)
@@ -140,13 +163,17 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
         "Backtest",
         f"Nested walk-forward backtest on 2021-2025 data only (never 2026), out of sample "
         f"{result.config.test_years[0]}-{result.config.test_years[-1]}: each year's models are trained on the "
-        f"years before it, and its hyperparameters are chosen on the test years before it. The account starts at "
-        f"$0 and buys every recommended stock for ${result.config.order_value:,.0f}; a return is the profit over "
-        f"the capital, the most the open orders cost at one time.\n\n```\n{format_summary(result)}\n```\n\n"
-        f"Final choice for the 2026 test (selection.json):\n\n"
+        f"years before it, and its hyperparameters are chosen on the test years before it. The account starts each "
+        f"test year with ${result.config.capital:,.0f} and buys the stocks recommended by the models chosen for the "
+        f"year in slices of ${result.config.order_value:,.0f}, at the 16:00 close of the day they are recommended, "
+        f"while its cash lasts: on the test years before it, only the models whose mean yearly return beat SPY held "
+        f"qualify, and the set of them whose account did best is traded. A return is the last equity over the "
+        f"starting capital, minus 1.\n\n```\n{format_summary(result)}\n```\n\n"
+        f"Final choice for the 2026 test and the API (selection.json):\n\n"
         f"```\n{selection_table(result).to_string(index=False)}\n```",
         inspect_first=["tables/summary.csv", "tables/yearly.csv", "selection.json", "tables/folds.csv",
-                       "figures/profit.png", "guards.json", "tables/scores.csv", "tables/metrics.csv"])
+                       "tables/combinations.csv", "figures/profit.png", "guards.json", "tables/scores.csv",
+                       "tables/metrics.csv"])
     return run.directory
 
 
