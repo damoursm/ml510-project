@@ -2,7 +2,9 @@
 
 Every file a backtest reads is listed and opened here. Only the year folders 2021..2025 are listed, a file is
 opened only when the date in its name is inside the window, and every row read is checked against its file's
-day; a row outside it raises LeakageError instead of being dropped. The bounds are constants, not settings.
+day; a row outside it raises LeakageError instead of being dropped. The bounds are constants, not settings: a
+WindowedStore's are its class's. Only the 2026 final test (stock_recommender/final_test.py, which no backtest module
+imports) reads through a subclass whose window ends later.
 """
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -31,8 +33,8 @@ class DataError(RuntimeError):
     """The backtest's input data is missing or inconsistent."""
 
 
-def in_window(day: date) -> bool:
-    return FIRST_DAY <= day <= LAST_DAY
+def in_window(day: date, first: date = FIRST_DAY, last: date = LAST_DAY) -> bool:
+    return first <= day <= last
 
 
 def check_window(start: date, end: date) -> None:
@@ -41,23 +43,27 @@ def check_window(start: date, end: date) -> None:
         raise LeakageError(f"Backtests use {FIRST_DAY}..{LAST_DAY} only, never 2026; got {start}..{end}.")
 
 
-def day_files(directory: Path) -> dict[date, Path]:
-    """Return the <year>/<YYYY-MM-DD>.parquet files dated inside the window, listing only the 2021..2025 folders.
+def day_files(directory: Path, first: date = FIRST_DAY, last: date = LAST_DAY) -> dict[date, Path]:
+    """Return the <year>/<YYYY-MM-DD>.parquet files dated inside the window, listing only its year folders
+    (2021..2025 for a backtest).
 
     A file whose date is outside the window or outside its year folder (e.g. 2025/2026-01-05.parquet) is skipped
     without being opened.
     """
     files = {}
-    for year in YEARS:
+    for year in range(first.year, last.year + 1):
         for path in sorted((Path(directory) / str(year)).glob(DAY_FILE)):
             day = date.fromisoformat(path.stem)
-            if day.year == year and in_window(day):
+            if day.year == year and in_window(day, first, last):
                 files[day] = path
     return files
 
 
 class WindowedStore:
-    """Reads a backtest's bars, splits and news from inside the window, and records every file it opens."""
+    """Reads a backtest's bars, splits and news from inside the window, and records every file it opens. The window
+    is the class's, 2021-2025, and no argument changes it."""
+    first_day = FIRST_DAY
+    last_day = LAST_DAY
 
     def __init__(self, bars_dir: Path, news_dir: Path, splits_path: Path, sentiment_dir: Path | None = None,
                  sentiment_model: str | None = None):
@@ -68,9 +74,20 @@ class WindowedStore:
         self.sentiment_model = sentiment_model
         self.opened: list[Path] = []
 
+    @property
+    def end_utc(self) -> pd.Timestamp:
+        """No article published from here on is read: the day after the window (END_UTC for a backtest)."""
+        return pd.Timestamp(self.last_day + timedelta(days=1), tz="UTC")
+
+    def _in_window(self, day: date) -> bool:
+        return in_window(day, self.first_day, self.last_day)
+
+    def _day_files(self, directory: Path) -> dict[date, Path]:
+        return day_files(directory, self.first_day, self.last_day)
+
     def _read(self, path: Path, day: date | None, columns: list[str] | None = None) -> pa.Table:
-        if day is not None and not in_window(day):
-            raise LeakageError(f"Refusing to open {path}: {day} is outside {FIRST_DAY}..{LAST_DAY}.")
+        if day is not None and not self._in_window(day):
+            raise LeakageError(f"Refusing to open {path}: {day} is outside {self.first_day}..{self.last_day}.")
         self.opened.append(path)
         return pq.read_table(path, columns=columns)
 
@@ -84,7 +101,7 @@ class WindowedStore:
 
     def read_bars(self) -> pd.DataFrame:
         """Return every 2021-2025 bar, sorted by date then ticker, with ticker as a category."""
-        files = day_files(self.bars_dir)
+        files = self._day_files(self.bars_dir)
         if not files:
             raise DataError(f"No 2021-2025 bars in {self.bars_dir}. Download them as traded: python "
                             "scripts/download_daily_bars.py --unadjusted --start 2021-01-01 --end 2025-12-31 "
@@ -104,9 +121,9 @@ class WindowedStore:
                             f"--end 2025-12-31 --out {path}")
         frame = self._read(path, None).to_pandas()
         frame[column] = pd.to_datetime(frame[column])
-        outside = frame[(frame[column].dt.date < FIRST_DAY) | (frame[column].dt.date > LAST_DAY)]
+        outside = frame[(frame[column].dt.date < self.first_day) | (frame[column].dt.date > self.last_day)]
         if len(outside):
-            raise LeakageError(f"{path} holds {len(outside)} {what} outside {FIRST_DAY}..{LAST_DAY}, "
+            raise LeakageError(f"{path} holds {len(outside)} {what} outside {self.first_day}..{self.last_day}, "
                                f"e.g. {outside.iloc[0].ticker} on {outside.iloc[0][column].date()}.")
         return frame
 
@@ -146,17 +163,17 @@ class WindowedStore:
         """Return the curated ticker changes (configs/ticker_changes_2021_2025.csv), all inside the window."""
         self.opened.append(Path(path))
         changes = pd.read_csv(path, parse_dates=["date"])
-        if len(changes[(changes.date.dt.date < FIRST_DAY) | (changes.date.dt.date > LAST_DAY)]):
-            raise LeakageError(f"{path} holds ticker changes outside {FIRST_DAY}..{LAST_DAY}.")
+        if len(changes[(changes.date.dt.date < self.first_day) | (changes.date.dt.date > self.last_day)]):
+            raise LeakageError(f"{path} holds ticker changes outside {self.first_day}..{self.last_day}.")
         return changes
 
     def read_actions(self, path: Path) -> pd.DataFrame:
         """Return the curated corporate actions (configs/corporate_actions_2021_2025.csv), all inside the window."""
         self.opened.append(Path(path))
         actions = pd.read_csv(path, parse_dates=["date"])
-        outside = actions[(actions.date.dt.date < FIRST_DAY) | (actions.date.dt.date > LAST_DAY)]
+        outside = actions[(actions.date.dt.date < self.first_day) | (actions.date.dt.date > self.last_day)]
         if len(outside):
-            raise LeakageError(f"{path} holds {len(outside)} actions outside {FIRST_DAY}..{LAST_DAY}.")
+            raise LeakageError(f"{path} holds {len(outside)} actions outside {self.first_day}..{self.last_day}.")
         return actions.fillna({"cash": 0.0, "shares_kept": 1.0, "distributed": "", "distributed_ratio": 0.0})
 
     def _read_news_day(self, day: date, path: Path) -> pa.Table:
@@ -164,14 +181,14 @@ class WindowedStore:
         if table.num_rows:
             low, high = (value.as_py() for value in pc.min_max(table.column("published_utc")).values())
             start = pd.Timestamp(day, tz="UTC")
-            if pd.Timestamp(low) < start or pd.Timestamp(high) >= min(start + pd.Timedelta(days=1), END_UTC):
+            if pd.Timestamp(low) < start or pd.Timestamp(high) >= min(start + pd.Timedelta(days=1), self.end_utc):
                 raise LeakageError(f"{path} holds articles published {low}..{high}, not only on {day} (UTC).")
         return table
 
     def read_news(self) -> pd.DataFrame:
         """Return every article published in 2021-2025 (UTC), sorted by publication time, with their LLM scores
         (llm_scores) when the store has a sentiment_dir."""
-        files = day_files(self.news_dir)
+        files = self._day_files(self.news_dir)
         if not files:
             news = pd.DataFrame(columns=NEWS_COLUMNS).astype({"published_utc": "datetime64[ms, UTC]"})
         else:
@@ -191,21 +208,21 @@ class WindowedStore:
         scores = sentiment.current(self._read(path, day).to_pandas(), self.sentiment_model)
         if len(scores):
             start, low, high = pd.Timestamp(day, tz="UTC"), scores.published_utc.min(), scores.published_utc.max()
-            if low < start or high >= min(start + pd.Timedelta(days=1), END_UTC):
+            if low < start or high >= min(start + pd.Timedelta(days=1), self.end_utc):
                 raise LeakageError(f"{path} scores articles published {low}..{high}, not only on {day} (UTC).")
         return scores
 
     def read_sentiment(self) -> pd.DataFrame:
         """Return the LLM scores of the articles published in 2021-2025 (UTC) by sentiment_model, under the
         current prompt (sentiment.PROMPT_VERSION)."""
-        files = day_files(self.sentiment_dir) if self.sentiment_dir is not None else {}
+        files = self._day_files(self.sentiment_dir) if self.sentiment_dir is not None else {}
         frames = [frame for frame in (self._read_sentiment_day(day, path) for day, path in files.items()) if len(frame)]
         return pd.concat(frames, ignore_index=True) if frames else sentiment.to_frame([])
 
     def audit(self) -> dict:
         """Count the files opened and check that none is outside the window."""
         dated = [path for path in self.opened if path.match(DAY_FILE)]
-        outside = [str(path) for path in dated if not in_window(date.fromisoformat(path.stem))]
+        outside = [str(path) for path in dated if not self._in_window(date.fromisoformat(path.stem))]
         if outside:
             raise LeakageError(f"Opened {len(outside)} files outside the window, e.g. {outside[0]}.")
         return {"files_opened": len(self.opened), "first_file_day": str(min(date.fromisoformat(p.stem) for p in dated)),

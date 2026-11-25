@@ -2,16 +2,16 @@
 rank among the day's tradable stocks over the next horizon_days (20 sessions in backtest/registry.py's news_boost).
 
 It came out of the news-model research of 2026-11-21 (a nested walk-forward over 2022-2025 on every 5th session):
-on 20-session returns it had a daily IC of about 0.02, positive in each test year, against 0.005 for news_forest's
-forest on 8 features over 5 sessions, and news drifts into prices over weeks rather than days.
+on 20-session returns it had a daily IC of about 0.02, positive in each test year, against 0.005 for a random forest
+on the 8 news features over 5 sessions, and news drifts into prices over weeks rather than days.
 
 - Rows: the stocks with an article tagged in the 7 days before a decision's news cutoff, preferred shares excluded
   (Polygon tags a bank's preferred series with the bank's news), on one decision day in every EVERY sessions; their
   labels overlap when the horizon is longer, which trees tolerate.
 - Target: the forward return over horizon_days as a percentile rank among all the day's tradable stocks, scaled to
-  -1..1 (news_forest.scaled_ranks), so a few volatile stocks cannot steer it.
+  -1..1 (scaled_ranks), so a few volatile stocks cannot steer it.
 - It is a joint model (Models.joint): it rates only those stocks and leaves the others NaN, so Models.score drops
-  them and they are never picked, unlike news_forest, whose unrated stocks counted as neutral and filled its list.
+  them and they are never picked.
 """
 from dataclasses import dataclass, field
 import re
@@ -19,13 +19,40 @@ import warnings
 import weakref
 import numpy as np
 import pandas as pd
-from .forest import training_days
-from .news_features import EXTENDED_NEWS_FEATURES, decision_extended_features, training_extended_features
-from .news_forest import _Labelled, scaled_ranks
+from .news_features import (EXTENDED_NEWS_FEATURES, NEWS_LOOKBACK_DAYS, decision_extended_features,
+                            training_extended_features)
 
 EVERY = 5  # Sessions between the training decision days.
 PREFERRED = re.compile(r"[A-Z]+p[A-Z]*")  # Polygon's preferred series, e.g. JPMpC.
 _TRAINING = weakref.WeakKeyDictionary()  # A fold's training data -> its training rows, for its other candidates.
+
+
+def training_days(days: pd.Series, every: int) -> pd.DatetimeIndex:
+    """Return one of the labelled decision days in `every`, counted back from the last."""
+    labelled = pd.DatetimeIndex(np.sort(pd.unique(days)))
+    return labelled[::-1][::max(1, every)][::-1]
+
+
+def scaled_ranks(returns: pd.Series, days: pd.Series) -> pd.Series:
+    """Return each return's percentile rank among its day's returns, scaled to -1..1: 2 (rank - 0.5) / n - 1, so a
+    day's ranks average 0 and run from just above -1 to just below 1. Ties share their mean rank."""
+    groups = returns.groupby(days)
+    return 2 * (groups.rank(method="average") - 0.5) / groups.transform("count") - 1
+
+
+class _Labelled:
+    """A fold's training data with only some of its labels, so that training_extended_features computes theirs
+    alone."""
+
+    def __init__(self, data, labels: pd.DataFrame):
+        self._data, self._labels = data, labels
+        self.news_lookback_days = getattr(data, "news_lookback_days", NEWS_LOOKBACK_DAYS)
+
+    def labels(self) -> pd.DataFrame:
+        return self._labels
+
+    def news(self) -> pd.DataFrame:
+        return self._data.news()
 
 
 def rated(features: pd.DataFrame) -> np.ndarray:

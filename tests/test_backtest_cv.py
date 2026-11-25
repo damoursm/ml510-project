@@ -8,11 +8,11 @@ import tempfile
 import unittest
 import numpy as np
 import pandas as pd
-from stock_recommender.backtest.account import basket, book, hold, mirror, trade
+from stock_recommender.backtest.account import basket, book, contributions, hold, mirror, sweep_growth, trade
 from stock_recommender.backtest.panel import Panel
 from stock_recommender.backtest.protocol import Period, news_window
 from stock_recommender.backtest.registry import GRIDS, UNTUNED, picking
-from stock_recommender.backtest.report import write_run, yearly_table
+from stock_recommender.backtest.report import format_summary, write_run, yearly_table
 from stock_recommender.backtest.run import Candidate, choose_combination, load_data, run_backtest, select
 from stock_recommender.backtest.window import LeakageError, WindowedStore
 from stock_recommender.config import Settings
@@ -104,6 +104,7 @@ class NestedTest(unittest.TestCase):
         self.assertEqual({name: standing["beats_spy"] for name, standing
                           in json.loads(folds.loc[2025, "against_spy"]).items()}, {"oracle": True, "wrong": False})
         self.assertAlmostEqual(scoped.profit["account", "2025"], scoped.profit["oracle", "2025"])
+        self.assertAlmostEqual(scoped.return_per_day["account", "2025"], scoped.return_per_day["oracle", "2025"])
         self.assertGreater(scoped.yearly_return["oracle", "2025"], 0.0)
         self.assertLess(scoped.yearly_return["wrong", "2025"], 0.0)
         filled = result.orders[result.orders.reason == "filled"]
@@ -131,6 +132,12 @@ class NestedTest(unittest.TestCase):
         self.assertAlmostEqual(against.yearly_return["oracle", 2025], scoped.yearly_return["oracle", "2025"])
         self.assertTrue(np.allclose(against.spy_mirror_return, 0.0))  # Flat SPY earns nothing on any dates.
         self.assertTrue((against.days_with_trades > 0).all())
+        # Idle cash held in SPY instead: flat and without costs here, it earns what cash does. No BIL in this data.
+        idle = result.idle_cash.set_index(["strategy", "idle_cash", "year"]).yearly_return
+        self.assertEqual(list(dict.fromkeys(result.idle_cash.idle_cash)), ["cash", "SPY"])
+        self.assertAlmostEqual(idle["account", "cash", 2025], scoped.yearly_return["account", "2025"])
+        self.assertAlmostEqual(idle["account", "SPY", 2025], idle["account", "cash", 2025])
+        self.assertAlmostEqual(idle["wrong", "SPY", 2024], scoped.yearly_return["wrong", "2024"])
 
     def test_only_models_whose_trades_beat_spy_enter_the_account(self):
         def run(spy_end: float):  # SPY's open and close glide from 400 to spy_end over the data.
@@ -148,6 +155,8 @@ class NestedTest(unittest.TestCase):
         self.assertGreater(standing["mean_yearly_return"], standing["spy_mirror_mean_return"])
         self.assertEqual(falling.selection["nested_estimate"]["combinations"], {"2024": ["random"], "2025": ["random"]})
         self.assertEqual(set(falling.final_models), {"random"})
+        swept = falling.idle_cash.set_index(["strategy", "idle_cash", "year"]).yearly_return
+        self.assertLess(swept["account", "SPY", 2024], swept["account", "cash", 2024] - 0.3)  # Idle cash in SPY sank.
 
         rising = run(2000.0)  # SPY triples in 2024: the same model falls short, so the account stands aside.
         folds = rising.folds.set_index("fold")
@@ -163,6 +172,11 @@ class NestedTest(unittest.TestCase):
         self.assertTrue((alone.reason == "filled").any())  # The model still trades alone, as reported.
         self.assertAlmostEqual(scoped.mean_yearly_return["account", "all"],
                                scoped.yearly_return["account", "2024"] / 2)
+        # Standing aside with its idle cash in SPY, the account is SPY held: all of its capital, all year.
+        swept = rising.idle_cash.set_index(["strategy", "idle_cash", "year"]).yearly_return
+        self.assertEqual(swept["account", "cash", 2025], 0.0)
+        self.assertAlmostEqual(swept["account", "SPY", 2025], scoped.yearly_return["spy_hold", "2025"])
+        self.assertGreater(swept["random", "SPY", 2025], swept["random", "cash", 2025])  # Its idle cash rose too.
         # Nothing beat SPY on 2024-2025 either: nothing is fit, and the API has nothing to serve.
         self.assertEqual(rising.selection["combination"]["models"], [])
         self.assertEqual((rising.selection["models"], rising.final_models), ({}, {}))
@@ -218,7 +232,7 @@ class NestedTest(unittest.TestCase):
         gap = choose_combination(table({**own, "a": ((np.nan, 0.9), (0.10, 0.10))}), names, years)  # No return.
         self.assertEqual((gap[0], gap[1]["a"]["qualifies"]), (("b", "d"), False))
 
-    def test_a_grid_tunes_how_many_stocks_a_model_trades(self):
+    def test_a_grid_tunes_how_many_stocks_a_model_trades_by_return_per_day(self):
         fits = []
 
         class Counted(Oracle):
@@ -229,17 +243,34 @@ class NestedTest(unittest.TestCase):
         grids = {"oracle": {"picks": (2, 1, "10%")}}  # Its best 2 or 1 stocks, or its best 10%: 3 of the 30.
         result = run_backtest(config(self.root, models=("oracle",), test_years=(2024, 2025)), factories,
                               grids=grids)
-        lists = result.scores[result.scores.year == 2024].set_index("candidate").stocks_per_list
-        self.assertEqual(lists.to_dict(), {'oracle{"picks": 2}': 2.0, 'oracle{"picks": 1}': 1.0,
-                                           'oracle{"picks": "10%"}': 3.0})
+        two, one, share = 'oracle{"picks": 2}', 'oracle{"picks": 1}', 'oracle{"picks": "10%"}'
+        scores = result.scores[result.scores.year == 2024].set_index("candidate")
+        self.assertEqual(scores.stocks_per_list.to_dict(), {two: 2.0, one: 1.0, share: 3.0})
         self.assertEqual(len(fits), 2 + 1)  # One fit a year for all three, and the final one.
-        # The oracle earns on every stock it lists, so its 2024 run with the most stocks did best: 2025 trades 3 a day.
-        self.assertEqual(json.loads(result.folds.set_index("fold").loc[2025, "chosen"]), {"oracle": {"picks": "10%"}})
+        # The oracle earns on every stock it lists, so in 2024 its longest list made the most on the $10,000, the cash
+        # it left idle aside; but its best stock made the most per invested dollar per day, so 2025 lists 1 a day.
+        self.assertGreater(scores.yearly_return[share], scores.yearly_return[two])
+        self.assertGreater(scores.return_per_day[one], scores.return_per_day[two])
+        self.assertTrue(np.allclose(scores.return_per_day, scores.profit / scores.invested_dollar_days))
+        # 2 stocks a session held 2 sessions: $400 of the $10,000 at most closes.
+        self.assertAlmostEqual(scores.invested_share[two], 0.04, places=3)
+        self.assertEqual(json.loads(result.folds.set_index("fold").loc[2025, "chosen"]), {"oracle": {"picks": 1}})
         listed = result.orders.groupby(["fold", "decision_date"]).size()
-        self.assertEqual((set(listed[2024]), set(listed[2025])), ({2}, {3}))  # 2024 runs the default, 2.
-        self.assertEqual(set(result.signals[result.signals.fold == 2025].picks), {3})
-        self.assertEqual((result.selection["models"]["oracle"]["pick_share"], result.final_models["oracle"].pick_share),
-                         (0.1, 0.1))
+        self.assertEqual((set(listed[2024]), set(listed[2025])), ({2}, {1}))  # 2024 runs the default, 2.
+        self.assertEqual(set(result.signals[result.signals.fold == 2025].picks), {1})
+        final = result.selection["models"]["oracle"]
+        self.assertEqual((final["picks"], final["pick_share"], result.final_models["oracle"].picks), (1, None, 1))
+        # Every list size beside the one chosen: what the choice compared, and how each did in 2025.
+        picks = result.picks.set_index(["choice", "picks"])
+        self.assertEqual(picks.loc["2025"].chosen.to_dict(), {"2": False, "1": True, "10%": False})
+        self.assertEqual(set(picks.loc["final"].chosen_on), {"2024-2025"})
+        self.assertAlmostEqual(picks.tuning_return_per_day["2025", "1"], scores.return_per_day[one])
+        later = result.scores[result.scores.year == 2025].set_index("candidate")
+        self.assertAlmostEqual(picks.test_return_per_day["2025", "10%"], later.return_per_day[share])
+        self.assertTrue(picks.loc["final"].test_return_per_day.isna().all())  # The 2026 test is never run.
+        scoped = result.metrics.set_index(["strategy", "scope"]).return_per_day
+        self.assertAlmostEqual(scoped["oracle", "2025"], later.return_per_day[one])
+        self.assertIn("2025 oracle: 1 a day", format_summary(result))
 
     def test_picks_is_a_whole_number_or_a_share_and_never_pick_share(self):
         self.assertTrue(all("picks" in grid for grid in GRIDS.values()))  # Every registered model tunes it.
@@ -266,6 +297,30 @@ class NestedTest(unittest.TestCase):
             select(scores, candidates, [2024, 2025], before=2025)
         tied = scores.assign(yearly_return=0.0)
         self.assertEqual(select(tied, candidates, [2024, 2025]), {"m": "a"})  # Ties keep grid order.
+
+    def test_the_list_size_is_chosen_by_return_per_day_once_the_other_settings_are(self):
+        # Per candidate, in grid order (the defaults first): its holding and list size, then in 2024 its yearly
+        # return, its profit and the dollars its open lots cost at each close, added up.
+        grid = [("a", 5, 20, 0.10, 1000.0, 2.5e6), ("b", 5, 5, 0.30, 3000.0, 1.0e6),
+                ("c", 10, 20, 0.20, 2000.0, 2.5e6), ("d", 10, 5, 0.05, 500.0, 2.5e5)]
+        candidates = [Candidate("m", (("hold_days", hold), ("picks", picks)), label) for label, hold, picks, *_ in grid]
+        scores = pd.DataFrame([{"model": "m", "candidate": label, "year": 2024, "yearly_return": mean, "profit": profit,
+                                "invested_dollar_days": dollars} for label, _, _, mean, profit, dollars in grid])
+        # At the default 20 a day, holding 10 (c, 0.20) beats holding 5 (a, 0.10); b's 0.30, at 5 a day, is never
+        # compared there. Then c's list sizes: d made 0.2% per invested dollar per day, c 0.08%, so 5 a day.
+        self.assertEqual(select(scores, candidates, [2024]), {"m": "d"})
+        # Ties, and a return per day nowhere, keep the default list size.
+        self.assertEqual(select(scores.assign(profit=0.0), candidates, [2024]), {"m": "c"})
+        self.assertEqual(select(scores.assign(invested_dollar_days=0.0), candidates, [2024]), {"m": "c"})
+        # Years pool: profit over dollars, both added up. d loses 600 on 2.5 million dollar-days in 2025, so it earned
+        # less per day than c over 2024-2025, though its two yearly ratios average more than c's.
+        later = pd.DataFrame([{"model": "m", "candidate": label, "year": 2025, "yearly_return": 0.1, "profit": profit,
+                               "invested_dollar_days": 2.5e6} for label, profit in
+                              (("a", 100.0), ("b", 100.0), ("c", 100.0), ("d", -600.0))])
+        both = pd.concat([scores, later], ignore_index=True)
+        self.assertEqual(select(both, candidates, [2024, 2025]), {"m": "c"})
+        ratios = both.assign(ratio=both.profit / both.invested_dollar_days).groupby("candidate").ratio.mean()
+        self.assertGreater(ratios["d"], ratios["c"])
 
 
 class LedgerCase(unittest.TestCase):
@@ -295,6 +350,120 @@ class LedgerCase(unittest.TestCase):
 
 
 class AccountTest(LedgerCase):
+    def test_idle_cash_held_in_a_ticker_grows_with_it_and_pays_costs_on_what_moves(self):
+        panel = self.panel({"A": [50.0] * 20, "S": [100.0 * 1.01 ** k for k in range(20)], "F": [80.0] * 20,
+                            "D": [100.0] + [50.0] * 19})
+        item = book(panel, "m", [Period(0, 2)], [self.listed(["A"], [50])], 100.0)  # One $100 lot, two sessions.
+        plain = trade(panel.sessions, [item], 0.0, capital=1000.0)
+        rising = trade(panel.sessions, [item], 0.0, capital=1000.0, sweep=sweep_growth(panel, "S"))
+        # The lot is flat; the $900 it left idle was held two sessions in a ticker up 1% a session.
+        self.assertAlmostEqual(plain.profit.iloc[-1], 0.0)
+        self.assertAlmostEqual(rising.profit.iloc[-1], 900.0 * 1.01 ** 2 - 900.0)
+        self.assertEqual((rising.filled, list(rising.spent[0])), (plain.filled, list(plain.spent[0])))
+        # The sweep pays the costs on the dollars it moves: bought at the first close with the cash the order and its
+        # fee left, sold at the last.
+        costly = trade(panel.sessions, [item], 10.0, capital=1000.0)
+        flat = trade(panel.sessions, [item], 10.0, capital=1000.0, sweep=sweep_growth(panel, "F"))
+        left = 1000.0 - 100.0 - 0.1
+        self.assertAlmostEqual(flat.fees.sum() - costly.fees.sum(), 0.001 * left + 0.001 * left * 0.999)
+        self.assertAlmostEqual(costly.profit.iloc[-1] - flat.profit.iloc[-1], flat.fees.sum() - costly.fees.sum())
+        # Only the cash moves, but it pays for the orders: halved in the sweep, it no longer covers the second.
+        two = book(panel, "m", [Period(0, 2), Period(1, 2)], [self.listed(["A"], [50])] * 2, 100.0)
+        self.assertEqual(trade(panel.sessions, [two], 0.0, capital=200.0).filled, 2)
+        self.assertEqual(trade(panel.sessions, [two], 0.0, capital=200.0, sweep=sweep_growth(panel, "D")).filled, 1)
+        self.assertIsNone(sweep_growth(panel, "NONE"))  # Not in the data.
+
+    def test_an_order_short_of_cash_sells_the_make_room_books_oldest_lots_first(self):
+        # A and B are flat; C rises 10% a session, so a lot of it sold early is worth what that session says.
+        panel = self.panel({"A": [100.0] * 20, "B": [100.0] * 20, "C": [100.0 * 1.1 ** k for k in range(20)]})
+        good = book(panel, "good", [Period(1, 4), Period(2, 4)], [self.listed(["A"], [100])] * 2, 100.0)
+        weak = book(panel, "weak", [Period(0, 4), Period(1, 4)], [self.listed(["C"], [100]),
+                                                                  self.listed(["B"], [100])], 100.0)
+        skip = trade(panel.sessions, [good, weak], 0.0, record=True, capital=200.0)
+        room = trade(panel.sessions, [good, weak], 0.0, record=True, capital=200.0, make_room=1)
+        skipped = skip.orders.set_index(["model", "decision_date"]).reason
+        # Without it, $200 buys weak's C at session 0 and good's A at session 1; then weak's B finds no cash, nor
+        # does good's second A at session 2 (the rows: good's A, A, then weak's C, B).
+        self.assertEqual(list(skipped), ["filled", "no_cash", "filled", "no_cash"])
+        rows = room.orders.set_index(["model", "decision_date"])
+        # With it, weak's own B at session 1 sells weak's older C, bought at 0, for its $110 there, and is bought.
+        c = rows.loc[("weak", self.sessions[0])]
+        self.assertEqual((c.exit_date, c.exit_rule), (self.sessions[1], "make_room"))
+        self.assertAlmostEqual(c.exit_value, 110.0)
+        self.assertAlmostEqual(c.mfe, 0.10)  # Its excursions end at its sale.
+        self.assertEqual(c.mae, 0.0)
+        # Session 2: good's second A finds $10, so it sells weak's oldest open lot, B (bought at 1, flat): $100.
+        b = rows.loc[("weak", self.sessions[1])]
+        self.assertEqual((b.reason, b.exit_date, b.exit_rule), ("filled", self.sessions[2], "make_room"))
+        self.assertEqual(rows.loc[("good", self.sessions[2])].reason, "filled")
+        # Every lot is bought; the account ends with its cash plus C's $10 gain, and A's lots run their course.
+        self.assertEqual(room.filled, 4)
+        self.assertEqual(rows.loc[("good", self.sessions[1])].exit_date, self.sessions[5])
+        self.assertAlmostEqual(room.profit.iloc[-1], 10.0)
+        self.assertEqual(list(room.invested), [100.0, 200.0, 200.0, 200.0, 200.0, 100.0, 0.0])
+        # Never a lot bought at this close: the weak book's own new lot is not sold for the good book's order.
+        same = book(panel, "weak", [Period(1, 4)], [self.listed(["B"], [100])], 100.0)
+        first = book(panel, "good", [Period(1, 4)], [self.listed(["A", "C"], [100, 100])], 100.0)
+        kept = trade(panel.sessions, [first, same], 0.0, record=True, capital=200.0, make_room=1)
+        self.assertEqual(list(kept.orders.reason), ["filled", "no_cash", "filled"])  # A, C, then B: C finds none.
+        with self.assertRaises(ValueError):
+            trade(panel.sessions, [good, weak], 0.0, make_room=2)
+
+    def test_with_its_idle_cash_in_a_sweep_an_order_spends_that_cash_before_it_sells_trades(self):
+        # A and B are flat; D, where the idle cash is held, rises 20% a session.
+        panel = self.panel({"A": [100.0] * 20, "B": [100.0] * 20, "D": [100.0 * 1.2 ** k for k in range(20)]})
+        good = book(panel, "good", [Period(1, 4), Period(2, 4)], [self.listed(["A"], [100])] * 2, 100.0)
+        weak = book(panel, "weak", [Period(0, 4)], [self.listed(["B"], [100])], 100.0)
+        plain = trade(panel.sessions, [good, weak], 0.0, record=True, capital=190.0, make_room=1)
+        swept = trade(panel.sessions, [good, weak], 0.0, record=True, capital=190.0, make_room=1,
+                      sweep=sweep_growth(panel, "D"))
+        # Kept as cash, the $90 weak's B leaves does not cover good's first A: B is sold for it at session 1, and the
+        # second A finds no cash and nothing left to sell.
+        rows = plain.orders.set_index(["model", "decision_date"])
+        b = rows.loc[("weak", self.sessions[0])]
+        self.assertEqual((b.exit_date, b.exit_rule), (self.sessions[1], "make_room"))
+        self.assertEqual(rows.loc[("good", self.sessions[2])].reason, "no_cash")
+        # Held in D, the $90 is worth $108 at session 1 and pays for the first A. B is sold only at session 2, when
+        # the $9.60 left there does not cover the second, and every order is bought.
+        rows = swept.orders.set_index(["model", "decision_date"])
+        b = rows.loc[("weak", self.sessions[0])]
+        self.assertEqual((b.exit_date, b.exit_rule), (self.sessions[2], "make_room"))
+        self.assertEqual(list(rows.loc["good"].reason), ["filled", "filled"])
+        self.assertEqual(swept.filled, 3)
+
+    def test_an_accounts_profit_splits_into_each_models_lots_and_its_idle_cash(self):
+        # A gains 10% at session 2; B is flat; S, where the idle cash may be held, rises 1% a session.
+        panel = self.panel({"A": [100.0, 100.0] + [110.0] * 18, "B": [100.0] * 20,
+                            "S": [100.0 * 1.01 ** k for k in range(20)]})
+        one = book(panel, "one", [Period(0, 2)], [self.listed(["A"], [100])], 100.0)
+        two = book(panel, "two", [Period(0, 2), Period(2, 2)], [self.listed(["B"], [100]),
+                                                                self.listed(["A"], [110])], 100.0)
+        plain = trade(panel.sessions, [one, two], 10.0, record=True, capital=1000.0)
+        parts = contributions(plain, panel.sessions, 10.0)
+        self.assertEqual(list(parts.index), ["one", "two", "idle_cash"])
+        # one's A is bought for $100 and sold for $110 at session 2, where two buys A for $100: the net $10 sale
+        # pays 0.1% of $10 there, split 110 : 100 between them. two's B and its A are flat.
+        self.assertAlmostEqual(parts.loc["one", "gross"], 10.0)
+        self.assertAlmostEqual(parts.loc["one", "costs"], 0.1 + 0.01 * 110 / 210)
+        self.assertAlmostEqual(parts.loc["two", "gross"], 0.0)
+        self.assertAlmostEqual(parts.loc["two", "costs"], 0.1 + 0.01 * 100 / 210 + 0.1 + 0.1)
+        self.assertEqual(parts.loc["idle_cash", "gross"], 0.0)  # Kept as cash, it earns nothing.
+        self.assertAlmostEqual(parts.profit.sum(), plain.profit.iloc[-1])
+        # Held in S, the same lots are bought, so the models' parts do not change; the idle cash's is what the
+        # account gained by it: the cash's growth, less the costs of moving it.
+        sweep = sweep_growth(panel, "S")
+        swept = trade(panel.sessions, [one, two], 10.0, record=True, capital=1000.0, sweep=sweep)
+        held = contributions(swept, panel.sessions, 10.0, sweep)
+        pd.testing.assert_frame_equal(held.loc[["one", "two"]], parts.loc[["one", "two"]])
+        self.assertGreater(held.loc["idle_cash", "gross"], 0.0)
+        self.assertAlmostEqual(held.loc["idle_cash", "costs"], swept.fees.sum() - plain.fees.sum())
+        self.assertAlmostEqual(held.loc["idle_cash", "profit"], swept.profit.iloc[-1] - plain.profit.iloc[-1])
+        self.assertAlmostEqual(held.profit.sum(), swept.profit.iloc[-1])
+        with self.assertRaises(ValueError):  # Not the sweep it was traded with: the parts do not add up.
+            contributions(swept, panel.sessions, 10.0)
+        with self.assertRaises(ValueError):  # Not recorded.
+            contributions(trade(panel.sessions, [one, two], 10.0, capital=1000.0), panel.sessions, 10.0)
+
     def test_a_slice_is_bought_at_the_recommendation_close_from_the_starting_cash(self):
         closes = [100.0, 100.0, 110.0, 121.0, 133.1] + [133.1] * 15
         panel = self.panel({"A": closes})
@@ -467,6 +636,12 @@ class OutputTest(unittest.TestCase):
         closes = self.prices["close"].iloc[t]
         self.assertTrue(np.allclose(result.trades.price, closes[result.trades.ticker].to_numpy()))
 
+    def test_idle_cash_names_distinct_tickers(self):
+        for wrong in (("cash",), ("SPY", "SPY"), ("",), (5,)):  # Refused before any data is read.
+            with self.assertRaisesRegex(ValueError, "idle_cash"):
+                config(self.root, idle_cash=wrong)
+        self.assertEqual(config(self.root).idle_cash, ("SPY", "BIL"))
+
     def test_a_run_saves_the_final_choice_for_2026_without_evaluating_it(self):
         result = run_backtest(config(self.root), {"flat": small_models})
         self.assertEqual(set(result.final_models), {"flat"})
@@ -480,7 +655,7 @@ class OutputTest(unittest.TestCase):
         self.assertFalse(selection["final_evaluated"])
         self.assertEqual(selection["saved_models"], {"flat": "model/flat.pkl"})
         self.assertEqual(pickle.loads((folder / "model/flat.pkl").read_bytes()).picks, 2)
-        for table in ("scores", "folds", "orders", "profit", "yearly", "metrics", "against_spy"):
+        for table in ("scores", "folds", "orders", "profit", "yearly", "metrics", "against_spy", "picks", "idle_cash"):
             self.assertTrue((folder / "tables" / f"{table}.csv").is_file(), table)
         yearly = yearly_table(result).set_index("strategy")
         self.assertEqual(list(yearly.index), ["flat", "account", "spy_hold", "spy_mirror", "universe_ew"])

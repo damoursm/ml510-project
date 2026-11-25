@@ -14,7 +14,6 @@ from stock_recommender.backtest.account import book, mirror, trade
 from stock_recommender.backtest.metrics import signal_summary
 from stock_recommender.backtest.protocol import Period, schedule, walk_forward
 from stock_recommender.backtest.run import BacktestConfig, run_backtest
-from stock_recommender.ensemble import Ensemble
 from stock_recommender.exits import EXIT_FIELDS, ExitRule, daily_volatility, excursions, exit_points, exit_rule
 from stock_recommender.models import RandomPriceModel, placeholder_models
 from stock_recommender.notify import exit_text
@@ -40,14 +39,13 @@ class RuleTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=wrong):
                 ExitRule(**wrong)
 
-    def test_every_bundle_has_a_rule_old_pickles_and_ensembles_too(self):
+    def test_every_bundle_has_a_rule_old_pickles_too(self):
         self.assertEqual(exit_rule(placeholder_models()), ExitRule(5))  # No setting: hold for the horizon.
         self.assertEqual(exit_rule(replace(placeholder_models(), hold_days=10, stop_loss=0.08)), ExitRule(10, 0.08))
         old = replace(placeholder_models(), horizon_days=3)
         for name in EXIT_FIELDS:  # As pickled before the exit settings existed.
             object.__delattr__(old, name)
         self.assertEqual(exit_rule(pickle.loads(pickle.dumps(old))), ExitRule(3))
-        self.assertEqual(exit_rule(Ensemble(((placeholder_models(), 1.0),))), ExitRule(5))
 
     def test_each_rule_sells_at_the_open_after_the_close_it_fires(self):
         nan = np.nan

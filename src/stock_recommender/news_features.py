@@ -5,7 +5,7 @@ features read those of the last NEWS_LOOKBACK_DAYS days; "1d" ones only those pu
 weekday's close. A pair is an article and one ticker it is tagged with. A pair is relevant when the LLM rated the
 article as at least one of the company's main subjects (relevance >= 1), and it weighs relevance / 2. Sentiment
 (-2..2) is scaled to -1..1, impact (0..2) to 0..1. Counts include every article tagged with the stock, scored or
-not; a feature that needs a scored relevant article is NaN without one (scikit-learn's random forests accept NaN).
+not; a feature that needs a scored relevant article is NaN without one (tree models such as LightGBM accept NaN).
 
 The two entry points compute the same features:
 - decision_news_features(news, tickers, cutoff): from a decision's articles (Snapshot.news) and news cutoff;

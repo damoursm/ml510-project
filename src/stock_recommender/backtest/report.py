@@ -13,8 +13,9 @@ from .run import BacktestResult
 # The reference categorical palette, in its fixed order (validated for adjacent lines).
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 SURFACE, INK, INK_SECONDARY, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-SUMMARY_COLUMNS = ["strategy", "capital", "profit", "mean_yearly_return", "daily_return", "volatility", "sharpe",
-                   "max_drawdown", "avg_turnover", "ic_mean", "excess_return_vs_spy_hold", "null_return_percentile"]
+SUMMARY_COLUMNS = ["strategy", "capital", "profit", "mean_yearly_return", "daily_return", "return_per_day",
+                   "invested_share", "volatility", "sharpe", "max_drawdown", "avg_turnover", "ic_mean",
+                   "excess_return_vs_spy_hold", "null_return_percentile"]
 
 
 def _plain(value):
@@ -45,6 +46,70 @@ def yearly_table(result: BacktestResult) -> pd.DataFrame:
     overall = result.metrics[result.metrics.scope == "all"].set_index("strategy")
     table["mean"] = overall.mean_yearly_return.reindex(order)
     return table.rename_axis(columns=None).reset_index()
+
+
+def idle_cash_table(result: BacktestResult) -> pd.DataFrame:
+    """Return the account's, then each strategy's, return in every test year with its idle cash kept as cash or held
+    in each ticker of config.idle_cash, and their mean (NaN when a year has none)."""
+    table = result.idle_cash
+    if table is None or not len(table):
+        return pd.DataFrame()
+    wide = table.pivot_table(index=["strategy", "idle_cash"], columns="year", values="yearly_return", dropna=False)
+    wide.columns = [str(year) for year in wide.columns]
+    wide["mean"] = wide.mean(axis=1, skipna=False)
+    if "max_drawdown" in table:  # The deepest fall within any one year, on the capital.
+        wide["worst_drawdown"] = table.groupby(["strategy", "idle_cash"]).max_drawdown.min()
+    strategies = list(dict.fromkeys(table.strategy))  # The account first, then the strategies in their order.
+    places = list(dict.fromkeys(table.idle_cash))  # Cash first, then the tickers in config order.
+    order = [(strategy, place) for strategy in strategies for place in places if (strategy, place) in wide.index]
+    return wide.reindex(order).reset_index()
+
+
+def per_day_table(result: BacktestResult) -> pd.DataFrame:
+    """Return each strategy's return per day in every test year (its profit over the dollars it had invested at each
+    close, added up: what an invested dollar earned per day held), and over all of them together."""
+    if "return_per_day" not in result.metrics:
+        return pd.DataFrame()
+    years = result.metrics[result.metrics.scope != "all"]
+    order = list(dict.fromkeys(years.strategy))
+    table = years.pivot(index="strategy", columns="scope", values="return_per_day").reindex(order)
+    table["all"] = result.metrics[result.metrics.scope == "all"].set_index("strategy").return_per_day.reindex(order)
+    return table.rename_axis(columns=None).reset_index()
+
+
+def picks_summary(result: BacktestResult) -> str:
+    """Say how many stocks a day each model listed in each tuned test year and in the final choice: the list size
+    with the best return per day on the years before (run.picks_table), beside the default's; then, for a test year,
+    how both did in it and which list size did best there."""
+    table = result.picks
+    if table is None or not len(table):
+        return ""
+    per_day, on_capital, lines = _percent(3), _percent(1), []
+
+    def named(row) -> str:
+        if not row.picks.endswith("%"):
+            return f"{row.picks} a day"
+        return f"{row.picks} (~{row.stocks_per_list:.0f} a day)" if pd.notna(row.stocks_per_list) else row.picks
+
+    for (choice, model), rows in table.groupby(["choice", "model"], sort=False):
+        mine, default = rows[rows.chosen].iloc[0], rows.iloc[0]
+        changed = mine.candidate != default.candidate
+        name = "2026 test and the API" if choice == "final" else choice
+        line = f"  {name} {model}: {named(mine)}, {per_day(mine.tuning_return_per_day)}/day on {mine.chosen_on}"
+        line += f" ({named(default)}: {per_day(default.tuning_return_per_day)})" if changed else " (the default)"
+        if choice != "final":
+            line += (f"; in {choice} {per_day(mine.test_return_per_day)}/day, {on_capital(mine.test_yearly_return)} "
+                     f"on the capital")
+            if changed:
+                line += (f" ({named(default)}: {per_day(default.test_return_per_day)}/day, "
+                         f"{on_capital(default.test_yearly_return)})")
+            tested = rows[rows.test_return_per_day.notna()]
+            if len(tested):
+                best = tested.loc[tested.test_return_per_day.astype(float).idxmax()]
+                line += ("; the best size there" if best.candidate == mine.candidate
+                         else f"; best there: {named(best)}, {per_day(best.test_return_per_day)}/day")
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def selection_table(result: BacktestResult) -> pd.DataFrame:
@@ -121,8 +186,11 @@ def format_summary(result: BacktestResult) -> str:
     for column in ("mean_yearly_return", "volatility", "max_drawdown", "excess_return_vs_spy_hold"):
         if column in table:
             table[column] = table[column].map(_percent(1))
-    if "daily_return" in table:
-        table["daily_return"] = table.daily_return.map(_percent(3))
+    for column in ("daily_return", "return_per_day"):
+        if column in table:
+            table[column] = table[column].map(_percent(3))
+    if "invested_share" in table:
+        table["invested_share"] = table.invested_share.map(lambda x: f"{x:.0%}" if pd.notna(x) else "")
     for column in ("sharpe", "avg_turnover", "ic_mean", "null_return_percentile"):
         if column in table:
             table[column] = table[column].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
@@ -141,9 +209,23 @@ def format_summary(result: BacktestResult) -> str:
     validated = (f"\n\nEach test year's account evaluated in the years that chose it, and the final choice's in "
                  f"every test year (in sample: what the choice saw, not what to expect; the account's row above is the "
                  f"out-of-sample result):\n{checked}" if checked else "")
+    days = per_day_table(result)
+    for column in days.columns[1:]:
+        days[column] = days[column].map(_percent(3))
+    per_day = (f"\n\nReturn per day on the dollars invested (profit over what the open lots cost at each close, "
+               f"added up; idle cash left out):\n{days.to_string(index=False)}" if len(days) else "")
+    sizes = picks_summary(result)
+    sized = (f"\n\nStocks a day, chosen by return per day on the test years before (the other settings chosen at the "
+             f"default list size by mean yearly return), and how they did the year after:\n{sizes}" if sizes else "")
+    idle = idle_cash_table(result)
+    for column in idle.columns[2:]:
+        idle[column] = idle[column].map(_percent(1))
+    swept = (f"\n\nIdle cash kept as cash, or held in {' or '.join(result.config.idle_cash)} (BIL: Treasury bills, "
+             f"for the interest), per test year; the same orders, out of sample, chosen as above:\n"
+             f"{idle.to_string(index=False)}" if len(idle) else "")
     return (f"{table.to_string(index=False)}\n\nReturn per test year (last equity over the "
             f"${result.config.capital:,.0f} capital, minus 1; ${result.config.order_value:,.0f} per order):\n"
-            f"{years.to_string(index=False)}\n\n"
+            f"{years.to_string(index=False)}{per_day}{sized}{swept}\n\n"
             f"Models the account traded (every model whose trades beat SPY bought with the same dollars on the same "
             f"dates, over the test years before):\n{combination_summary(result)}{against}{validated}")
 
@@ -198,6 +280,8 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
     run.save_table("metrics", result.metrics)
     run.save_table("scores", result.scores)
     run.save_table("against_spy", result.against_spy)
+    run.save_table("picks", result.picks)
+    run.save_table("idle_cash", result.idle_cash)
     run.save_table("profit", result.profit.rename_axis("date"), index=True)
     run.save_table("folds", result.folds)
     run.save_table("orders", result.orders)
@@ -211,7 +295,8 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
         "Backtest",
         f"Nested walk-forward backtest on 2021-2025 data only (never 2026), out of sample "
         f"{result.config.test_years[0]}-{result.config.test_years[-1]}: each year's models are trained on the "
-        f"years before it, and its hyperparameters are chosen on the test years before it. The account starts each "
+        f"years before it, and its hyperparameters are chosen on the test years before it, at the default list size "
+        f"by mean yearly return, then its list size by return per day (tables/picks.csv). The account starts each "
         f"test year with ${result.config.capital:,.0f} and buys the stocks recommended by the models chosen for the "
         f"year in slices of ${result.config.order_value:,.0f}, at the 16:00 close of the day they are recommended, "
         f"while its cash lasts: every model whose trades beat SPY bought with the same dollars on the same dates, on "
@@ -220,7 +305,9 @@ def write_run(result: BacktestResult, label: str = "backtest", root: Path = ROOT
         f"Final choice for the 2026 test and the API (selection.json):\n\n"
         f"```\n{selection_table(result).to_string(index=False)}\n```",
         inspect_first=["tables/summary.csv", "tables/yearly.csv", "selection.json", "tables/folds.csv",
-                       "tables/against_spy.csv", "figures/profit.png", "guards.json", "tables/scores.csv",
+                       "tables/picks.csv", "tables/idle_cash.csv", "tables/against_spy.csv", "figures/profit.png",
+                       "guards.json",
+                       "tables/scores.csv",
                        "tables/metrics.csv"])
     return run.directory
 

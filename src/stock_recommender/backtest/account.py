@@ -12,6 +12,9 @@ one close (16:00) at a time:
   (no_cash);
 - costs are cost_bps on the value traded, netted per ticker at each close (a stock one lot sells and another buys
   pays only on the difference), paid from the cash.
+With make_room (the served account's rule: the book of the model with the worst return per day), an order the cash
+does not cover first sells that book's open lots, oldest first, at this close, until it does: for any order, that
+book's own included, never a lot bought at this close. Only once none is left is the order skipped (no_cash).
 The account's equity at a close is its cash plus what its open lots are worth there; its yearly return is its last
 equity over its starting capital, minus 1. Every test year starts afresh with the starting capital. Every order
 records its excursions: the best and worst close return while held.
@@ -24,7 +27,8 @@ A lot is valued as Panel.forward_returns values a holding: splits, reinvested di
 renames, and a halt or delisting at its last close.
 
 holdings() summarizes one model's ledger per decision: what its orders cost, their profit before and after costs,
-and the turnover at its entry.
+and the turnover at its entry. contributions() splits an account's profit into what each model's lots made and
+what its idle cash made, after their costs.
 
 The references trade through the same ledger, from the same capital, with fractional shares. mirror() and basket()
 spend the account's dollars on its dates, so they buy every one of its orders whatever their own cash
@@ -34,7 +38,15 @@ spend the account's dollars on its dates, so they buy every one of its orders wh
 - basket(): the same dollars spread equally over the tradable universe of the order's decision day, held to the
   end of the period whatever the exit rule;
 - hold(): one ticker bought with the whole capital at the account's first entry and held to its last exit.
+
+Idle cash earns nothing by default. trade(sweep=...) holds it in one ticker instead: SPY, or a Treasury bill fund
+(BIL) for the interest. sweep_growth gives that ticker's growth from each close to the next, dividends reinvested:
+- at each close, before the lots due are sold, the cash grows as the ticker did since the close before;
+- the dollars moved in or out of it there (the close's sales, less its purchases and costs) pay cost_bps like a
+  stock;
+- the first close buys it with the cash its orders left, and the last close sells it.
 """
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 import numpy as np
@@ -49,6 +61,10 @@ ORDER_COLUMNS = ["model", "ticker", "decision_date", "entry_date", "exit_date", 
                  "fill", "cost", "exit_value", "gross_profit", "reason", "exit_rule", "mfe", "mae"]
 HOLDING_COLUMNS = ["decision_date", "entry_date", "exit_date", "listed", "filled", "invested", "gross_profit", "fees",
                    "net_profit", "net_return", "turnover"]
+# contributions(): per part (each model, then IDLE_PART), what it made before costs, its costs, and the difference.
+PART_COLUMNS = ["gross", "costs", "profit"]
+IDLE_PART = "idle_cash"
+ADDS_UP = 1e-6  # Dollars: how far contributions()' parts may be from the ledger's profit.
 
 
 @dataclass(frozen=True)
@@ -181,22 +197,47 @@ def _bought(item: Book, whole_shares: bool) -> tuple[np.ndarray, np.ndarray]:
     return shares, cost
 
 
+def sweep_growth(panel: Panel, ticker: str) -> np.ndarray | None:
+    """Per session, what a dollar held in `ticker` from the close before is worth at this close, on the basis the
+    panel values a holding (splits, reinvested dividends, large payouts): 1.0 at the first session and before its
+    first close. None when the ticker is not in the data."""
+    (code,) = panel.codes(np.array([ticker], dtype=object))
+    if code < 0:
+        return None
+    mark, paid = panel.mark_close[:, code], panel.paid_out[:, code]
+    growth = np.ones(len(panel.sessions))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        growth[1:] = (mark[1:] + paid[1:] - paid[:-1]) / mark[:-1]
+    return np.where(np.isfinite(growth) & (growth > 0), growth, 1.0)
+
+
 def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_shares: bool = False,
-          record: bool = False, capital: float = CAPITAL, cash_limit: bool = True) -> Ledger:
+          record: bool = False, capital: float = CAPITAL, cash_limit: bool = True,
+          sweep: np.ndarray | None = None, make_room: int | None = None) -> Ledger:
     """Run the account through its books from `capital` in cash, one close at a time: sell the lots that are due,
     then buy the day's lots, the best-ranked first across the books, while the cash covers each (no_cash
     otherwise), and pay the costs, netted per ticker.
 
+    With make_room, the index of one of the books, an order the cash does not cover first sells that book's open
+    lots, oldest first, at this close's value, until it does; never a lot bought at this close. A lot sold so ends
+    there: its exit, value and excursions are this close's, and its exit_rule is "make_room".
+
     Without the cash limit every lot is bought whatever the cash, which may then go below zero: as a reference that
     spends another account's dollars on its dates does. Its profit is still its equity minus its capital, which is
-    what its lots earned after costs."""
+    what its lots earned after costs.
+
+    With a sweep (sweep_growth, per session), the cash is held in that ticker from each close to the next, so it
+    grows or shrinks with it; the dollars moved in or out at a close pay the costs (in the ledger's fees), and the
+    last close sells it. Only the cash moves: the orders are the same lots, bought while the cash covers them."""
     rate = cost_bps / 1e4
     start = min(item.start for item in books)
     end = max(item.end for item in books)
     span = end - start + 1
     lots, entering = [], {}  # Per book: its lots' sale, shares, cost, proceeds and values; per close, its entries.
+    if make_room is not None and not 0 <= make_room < len(books):
+        raise ValueError(f"make_room is a book's index, 0..{len(books) - 1}; got {make_room}.")
     for b, item in enumerate(books):
-        after = item.sold_after()
+        after = item.sold_after().copy()  # A lot sold to make room ends earlier.
         shares, cost = _bought(item, whole_shares)
         values = shares[:, None] * np.where(np.isfinite(item.fill)[:, None], item.path, 0.0)  # Unfilled: no marks.
         lots.append((after, shares, cost, values[np.arange(len(after)), after], values))
@@ -205,19 +246,55 @@ def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_
             entering.setdefault(int(item.decision[lot]), []).append((int(ranks[lot]), b, int(lot)))
     bought = [np.zeros(len(item.decision), dtype=bool) for item in books]
     short = [np.zeros(len(item.decision), dtype=bool) for item in books]
+    forced = [np.zeros(len(item.decision), dtype=bool) for item in books]  # Sold to make room.
     incoming, cash_at, fees, traded = np.zeros(span), np.zeros(span), np.zeros(span), np.zeros(span)
     sold: dict[int, dict] = {}  # Close -> ticker -> dollars the lots due there bring.
     cash = float(capital)
+    swept = 0.0  # The cash held in the sweep since the close before.
+    queue: deque = deque()  # The make_room book's bought lots, oldest first.
+
+    def sell_to_make_room(session: int, needed: float) -> float:
+        """Sell the make_room book's oldest open lots at this close until `needed` is covered; return the cash."""
+        after, _, _, proceeds, values = lots[make_room]
+        room, raised = books[make_room], 0.0
+        while needed > raised + 1e-9 and queue:
+            lot = queue[0]
+            due = int(room.decision[lot] + after[lot])
+            if due <= session:  # Sold at its own exit already.
+                queue.popleft()
+                continue
+            if room.decision[lot] >= session:  # Bought at this close, as are the ones after it: kept.
+                break
+            queue.popleft()
+            held = session - int(room.decision[lot])
+            value = float(values[lot, held])
+            ticker = room.ticker[lot]
+            incoming[due - start] -= proceeds[lot]  # Not sold at its scheduled exit any more.
+            sold[due][ticker] -= proceeds[lot]
+            here = sold.setdefault(session, {})
+            here[ticker] = here.get(ticker, 0.0) + value
+            after[lot], proceeds[lot], forced[make_room][lot] = held, value, True
+            raised += value
+        return raised
+
     for session in range(start, end + 1):
+        if sweep is not None and swept > 0:
+            grown = swept * float(sweep[session])
+            cash += grown - swept
+            swept = grown
         cash += incoming[session - start]  # The lots due at this close are sold first.
         into: dict = {}
         for _, b, lot in sorted(entering.get(session, ())):  # Best-ranked first, each book in turn.
             after, _, cost, proceeds, _ = lots[b]
+            if cash_limit and make_room is not None and cost[lot] > cash + 1e-9:
+                cash += sell_to_make_room(session, cost[lot] - cash)
             if cash_limit and cost[lot] > cash + 1e-9:
                 short[b][lot] = True
                 continue
             cash -= cost[lot]
             bought[b][lot] = True
+            if b == make_room:
+                queue.append(lot)
             ticker = books[b].ticker[lot]
             into[ticker] = into.get(ticker, 0.0) + cost[lot]
             out_at = session + int(after[lot])
@@ -228,6 +305,12 @@ def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_
         traded[session - start] = sum(abs(into.get(name, 0.0) - out.get(name, 0.0)) for name in set(into) | set(out))
         fees[session - start] = rate * traded[session - start]
         cash -= fees[session - start]
+        if sweep is not None:  # The cash left goes into the sweep, or comes out of it; at the last close, all of it.
+            target = max(cash, 0.0) if session < end else 0.0
+            moved = rate * abs(target - swept)
+            fees[session - start] += moved
+            cash -= moved
+            swept = max(cash, 0.0) if session < end else 0.0
         cash_at[session - start] = cash
     worth, invested = np.zeros(span), np.zeros(span)  # What the open lots are worth, and cost, at each close.
     rows = []
@@ -243,15 +326,19 @@ def trade(sessions: pd.DatetimeIndex, books: list[Book], cost_bps: float, whole_
                 shares == 0, "price_above_order", np.where(short[b], "no_cash", "filled")))
             paid, back = np.where(mine, cost, 0.0), np.where(mine, proceeds, 0.0)
             missing = np.full(len(after), np.nan)
+            why = item.why if item.why is not None else np.full(len(after), "", dtype=object)
+            mfe = item.mfe.copy() if item.mfe is not None else missing.copy()
+            mae = item.mae.copy() if item.mae is not None else missing.copy()
+            for lot in np.flatnonzero(forced[b]):  # Its excursions end where it was sold.
+                returns = item.path[lot, 1:after[lot] + 1] / item.fill[lot] - 1
+                mfe[lot], mae[lot] = max(float(returns.max()), 0.0), min(float(returns.min()), 0.0)
             rows.append(pd.DataFrame({
                 "model": item.model, "ticker": item.ticker, "decision_date": sessions[item.decision],
                 "entry_date": sessions[item.decision], "exit_date": sessions[item.decision + after],
                 "price": item.price, "order_value": item.amount, "shares": np.where(mine, shares, 0.0),
                 "fill": item.fill, "cost": paid, "exit_value": back, "gross_profit": back - paid,
                 "reason": reasons.astype(object),
-                "exit_rule": item.why if item.why is not None else np.full(len(after), "", dtype=object),
-                "mfe": item.mfe if item.mfe is not None else missing,
-                "mae": item.mae if item.mae is not None else missing}))
+                "exit_rule": np.where(forced[b], "make_room", why).astype(object), "mfe": mfe, "mae": mae}))
     index = sessions[start:end + 1]
     orders = None
     if record:
@@ -285,6 +372,68 @@ def holdings(ledger: Ledger, periods: list[Period], sessions: pd.DatetimeIndex) 
                      "net_return": (gross - fees) / invested if invested > 0 else np.nan,
                      "turnover": float(ledger.traded.get(entry, 0.0)) / invested if invested > 0 else np.nan})
     return pd.DataFrame(rows, columns=HOLDING_COLUMNS)
+
+
+def contributions(ledger: Ledger, sessions: pd.DatetimeIndex, cost_bps: float,
+                  sweep: np.ndarray | None = None) -> pd.DataFrame:
+    """Split a recorded account's profit at its last close (trade(record=True)) into what made it, in dollars, one
+    row per part (PART_COLUMNS: gross, costs, and profit, the gross less the costs):
+    - each model, in book order: what its lots were sold for less what they cost, and the costs of trading them;
+    - IDLE_PART: what the cash not in lots earned in the sweep the account was traded with (sweep_growth, per
+      session; nothing when it was kept as cash), and the costs of moving it in and out.
+    The costs are netted per ticker at each close, as trade() pays them: where lots of two models trade one ticker at
+    one close, the cost of the net trade there is split in proportion to each model's own net dollars in it.
+    The parts add up to the ledger's last profit; this raises if they do not, as when the sweep is not the one the
+    account was traded with."""
+    if ledger.orders is None or ledger.fees is None or ledger.traded is None:
+        raise ValueError("contributions needs a recorded ledger: trade(record=True).")
+    rate = cost_bps / 1e4
+    closes = ledger.profit.index
+    lots = ledger.orders[ledger.orders.reason == "filled"]
+    models = list(dict.fromkeys(ledger.orders.model))
+    # Per close, ticker and model: the dollars its lots bought there, less those its lots were sold for.
+    moves = pd.concat([pd.DataFrame({"close": lots.entry_date, "ticker": lots.ticker, "model": lots.model,
+                                     "net": lots.cost.astype(float)}),
+                       pd.DataFrame({"close": lots.exit_date, "ticker": lots.ticker, "model": lots.model,
+                                     "net": -lots.exit_value.astype(float)})], ignore_index=True)
+    charged = pd.Series(dtype=float)
+    if len(moves):
+        net = moves.groupby(["close", "ticker", "model"]).net.sum()
+        same = ["close", "ticker"]
+        paid = rate * net.groupby(level=same).transform("sum").abs()  # The cost of the net trade in the ticker.
+        own = net.abs()
+        weight = own.groupby(level=same).transform("sum")
+        charged = (paid * own / weight.where(weight > 0, 1.0)).groupby(level="model").sum()
+    gross = lots.groupby("model").gross_profit.sum()
+    parts = {model: (float(gross.get(model, 0.0)), float(charged.get(model, 0.0))) for model in models}
+    # The idle cash: the account's cash, replayed close by close from its lots and its costs.
+    position = sessions.get_indexer(closes)
+    flows = pd.concat([pd.Series(lots.exit_value.to_numpy(dtype=float), index=pd.DatetimeIndex(lots.exit_date)),
+                       pd.Series(-lots.cost.to_numpy(dtype=float), index=pd.DatetimeIndex(lots.entry_date))])
+    by_close = flows.groupby(level=0).sum()
+    if (position < 0).any() or not by_close.index.isin(closes).all():
+        raise ValueError("The ledger's lots trade at closes outside its sessions.")
+    flow = by_close.reindex(closes, fill_value=0.0).to_numpy() - ledger.fees.to_numpy()
+    cash, swept, earned = float(ledger.capital), 0.0, 0.0
+    for k, session in enumerate(position):
+        if sweep is not None and swept > 0:  # As trade() holds it: what the close before left, until the last.
+            gain = swept * (float(sweep[session]) - 1.0)
+            cash, swept, earned = cash + gain, swept + gain, earned + gain
+        cash += flow[k]
+        if sweep is not None:
+            swept = max(cash, 0.0) if k < len(position) - 1 else 0.0
+    trading = rate * float(ledger.traded.sum())  # The lots' costs; the rest of the fees moved the idle cash.
+    parts[IDLE_PART] = (earned, float(ledger.fees.sum()) - trading)
+    table = pd.DataFrame([(gain, cost, gain - cost) for gain, cost in parts.values()],
+                         index=pd.Index(list(parts), name="part"), columns=PART_COLUMNS)
+    last = float(ledger.profit.iloc[-1]) if len(ledger.profit) else 0.0
+    gaps = {"the replayed cash": cash - ledger.capital - last, "the parts": float(table.profit.sum()) - last,
+            "the lots' costs": float(charged.sum()) - trading}
+    wrong = {name: gap for name, gap in gaps.items() if abs(gap) > ADDS_UP}
+    if wrong:
+        raise ValueError(f"The account's profit does not add up from its parts (off by {wrong}): is the sweep the "
+                         f"one it was traded with?")
+    return table
 
 
 def _reference(item: Book, name: str, decision: np.ndarray, tickers: np.ndarray, fill: np.ndarray,

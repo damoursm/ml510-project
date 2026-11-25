@@ -140,14 +140,7 @@ def correlations(ranked: pd.Index, values: pd.DataFrame) -> list[dict]:
 
 def importances(model) -> dict[str, float] | None:
     """Return the importances a model measures itself, by feature: its price, news and joint parts'
-    feature_importances(), or an ensemble's members' weighted by their weights; None when no part measures any."""
-    members = getattr(model, "members", None)
-    if members is not None:  # An Ensemble.
-        total, weights = {}, sum(weight for _, weight in members) or 1.0
-        for member, weight in members:
-            for name, value in (importances(member) or {}).items():
-                total[name] = total.get(name, 0.0) + weight / weights * value
-        return total or None
+    feature_importances(); None when no part measures any."""
     found = {}
     for part in (getattr(model, "price", None), getattr(model, "news", None), getattr(model, "joint", None)):
         measure = getattr(part, "feature_importances", None)

@@ -36,6 +36,10 @@ def compose(body: RecommendationList, sender: str, recipients: list[str]) -> Ema
              f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}{source}. "
              f"Exit: {exit_text(body)}.")
     text, html = [intro], [f"<p>{escape(intro)}</p>"]
+    if body.account:  # How an account trades the buys, as the served run's backtest did.
+        rule = f"Account rule: {body.account.summary}"
+        text.append(rule)
+        html.append(f"<p>{escape(rule)}</p>")
     if body.fetch and body.fetch.errors:  # The lists come from the older data still on disk.
         warning = "Warning: fetching new data failed, so these lists may be stale: " + "; ".join(body.fetch.errors)
         text.append(warning)

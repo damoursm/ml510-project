@@ -10,17 +10,20 @@ module (tests/test_backtest.py), since it loads models fit on the test years.
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import pickle
 import re
+import pandas as pd
 from .backtest.window import FIRST_DAY
 from .config import ROOT, Settings
 from .exits import exit_rule
 from .recommend import Recommendations, recommend
+from .schemas import AccountRule
 
 TEST_YEAR = 2026  # The reserved final test: a served selection was chosen and fit on the years before it.
 # /health lists those changed since the run.
-DECISION_PATH = ("recommend.py", "models.py", "data.py", "ensemble.py", "exits.py")
+DECISION_PATH = ("recommend.py", "models.py", "data.py", "exits.py")
 SIZES = ("horizon_days", "bars_lookback", "news_lookback_days", "picks")
 MODEL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
@@ -36,7 +39,7 @@ class SelectedModel:
     picks: int
     source: str  # The saved_models entry, e.g. "model/most_liquid.pkl".
     sha256: str | None
-    models: object | None  # The unpickled Models or Ensemble; None when it did not load.
+    models: object | None  # The unpickled Models; None when it did not load.
     error: str | None
     pick_share: float | None = None  # In place of picks: the share of the stocks it ranks that it lists.
 
@@ -54,6 +57,13 @@ class Selection:
     models: tuple[SelectedModel, ...]
     code_changed: tuple[str, ...]  # DECISION_PATH files whose sha256 differs from the run's manifest.
     error: str | None
+    capital: float | None = None  # The run's account: its starting cash, order value and costs.
+    order_value: float | None = None
+    cost_bps: float | None = None
+    # The served account rule (_make_room): the model whose oldest trades an order the cash does not cover sells first,
+    # and each loaded model's return per day it was chosen by, (name, value).
+    make_room: str | None = None
+    return_per_day: tuple = ()
 
     @property
     def loaded(self) -> tuple[SelectedModel, ...]:
@@ -77,6 +87,42 @@ class Selection:
         """Rank the stocks with each loaded model from the newest files on disk, in the selection's order."""
         served = self.settings(settings)
         return [(model, recommend(served, model.models)) for model in self.loaded]
+
+    def account_rule(self) -> AccountRule | None:
+        """How an account trades the buy lists, the guide the API states beside them (it keeps no account): the run's
+        backtest account, buying each listed stock for order_value at the close of its day, each model's best first
+        and the models in turn, and selling each by its model's exit, except that an order the cash does not cover
+        first sells make_room's oldest trades (account.trade make_room). None when the run records no account."""
+        if not (self.capital and self.order_value and self.cost_bps is not None):
+            return None
+        if self.make_room:
+            room = (f"When an order finds no cash, first sell {self.make_room}'s oldest trades, never one bought the "
+                    f"same day: {self.make_room} earned the least per invested dollar per day in the backtest.")
+        else:
+            room = "When an order finds no cash, skip it."
+        summary = (f"From ${self.capital:,.0f}, buy ${self.order_value:,.0f} of each stock to buy at today's close, "
+                   f"each model's #1 first, then each one's #2, and so on, and sell each when its model's exit says. "
+                   f"{room} Costs: {self.cost_bps:g} bps a side. Idle cash stays cash.")
+        return AccountRule(capital=self.capital, order_value=self.order_value, cost_bps=self.cost_bps,
+                           make_room=self.make_room, summary=summary)
+
+
+def _make_room(folder: Path, names: tuple[str, ...]) -> tuple[str | None, tuple]:
+    """The served account rule's model: of the served models, the one with the worst return per day trading alone
+    over the run's test years, as the run measured its final choice (tables/picks.csv tuning_return_per_day), with
+    each one's value. None with one model, or when the run lacks those values."""
+    if len(names) < 2:
+        return None, ()
+    try:
+        table = pd.read_csv(folder / "tables" / "picks.csv")
+        final = table[(table.choice.astype(str) == "final") & (table.chosen.astype(str).str.lower() == "true")]
+        found = {str(model): float(value) for model, value in zip(final.model, final.tuning_return_per_day)}
+    except (OSError, ValueError, KeyError, AttributeError, pd.errors.ParserError):
+        return None, ()
+    if not all(name in found and math.isfinite(found[name]) for name in names):
+        return None, ()
+    scores = tuple((name, found[name]) for name in names)
+    return min(scores, key=lambda pair: pair[1])[0], scores
 
 
 def _shown(path: Path) -> str:
@@ -124,8 +170,8 @@ def _load_model(folder: Path, name, entry, saved) -> SelectedModel:
         content = pickled.read_bytes()
         loaded = pickle.loads(content)
         if not callable(getattr(loaded, "score", None)):
-            raise TypeError(f"a {type(loaded).__name__} is not a Models or an Ensemble")
-        for key in ("version", *SIZES, "pick_share"):  # Duck typing: an Ensemble passes too.
+            raise TypeError(f"a {type(loaded).__name__} is not a Models")
+        for key in ("version", *SIZES, "pick_share"):
             if getattr(loaded, key, None) != getattr(model, key):
                 raise ValueError(f"its {key} is {getattr(loaded, key, None)!r}, not the selection's "
                                  f"{getattr(model, key)!r}")
@@ -165,7 +211,9 @@ def load_selection(spec: str) -> Selection:
                         training_end=selection.get("training_end"), min_price=float(selection["min_price"]),
                         min_dollar_volume=float(selection["min_dollar_volume"]),
                         sentiment_model=configuration.get("sentiment_model")
-                        if configuration.get("sentiment_dir") else None)
+                        if configuration.get("sentiment_dir") else None,
+                        **{key: float(selection[key]) if selection.get(key) is not None else None
+                           for key in ("capital", "order_value", "cost_bps")})
         entries, saved = selection.get("models"), selection.get("saved_models") or {}
         sources = manifest.get("source_sha256") or {}
     except Exception as error:
@@ -190,4 +238,5 @@ def load_selection(spec: str) -> Selection:
                 if isinstance(sources, dict) else {})
     changed = tuple(name for name in DECISION_PATH if (key := f"src/stock_recommender/{name}") in recorded
                     and _file_sha256(ROOT / key) != recorded[key])
-    return replace(known, models=models, code_changed=changed)
+    room, per_day = _make_room(folder, tuple(model.name for model in models if model.models is not None))
+    return replace(known, models=models, code_changed=changed, make_room=room, return_per_day=per_day)

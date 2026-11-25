@@ -33,6 +33,18 @@ class ExitStrategy(BaseModel):
     summary: str  # The rule in words.
 
 
+class AccountRule(BaseModel):
+    """How an account trades the buy lists: as the served run's backtest account did, with one change (account.trade
+    make_room). A guide: the API keeps no account."""
+    capital: float  # The cash the account starts with.
+    order_value: float  # The dollars of each stock to buy, bought at the close of the day it is listed.
+    cost_bps: float  # Per side, on the value traded.
+    # The served model whose oldest open trades an order the cash does not cover sells first, never one bought the same
+    # day; None: such an order is skipped.
+    make_room: str | None = None
+    summary: str  # The rule in words.
+
+
 class FetchReport(BaseModel):
     errors: list[str]  # Empty when both downloads succeeded.
 
@@ -49,6 +61,7 @@ class RecommendationList(BaseModel):
     generated_at: datetime
     horizon_days: int  # The longest a listed stock is held: the largest hold_days among the models.
     exits: dict[str, ExitStrategy] = {}  # Each model's exit strategy, by the names in Recommendation.model.
+    account: AccountRule | None = None  # With a served run: how its account trades the buy lists.
     model_version: str
     universe_size: int
     buy: list[Recommendation]  # Best scores first; with several selected models, each one's in turn.

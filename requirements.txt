@@ -20,6 +20,8 @@ python-dotenv==1.0.1
 pyarrow==23.0.0
 
 # Recommendations API (src/stock_recommender); tzdata gives Windows its time zones, httpx runs the tests.
+# lightgbm is the news_boost model's booster.
+lightgbm==4.6.0
 fastapi==0.161.1
 uvicorn==0.54.0
 tzdata==2025.3

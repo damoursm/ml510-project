@@ -6,10 +6,13 @@ the stocks and buys its list at that close, from $10,000 (--capital) in $100 sli
 cash lasts, and holds each for its hold_days, or sells it earlier when its exit rule fires; sales pay for later
 orders (--back-to-back decides every hold_days sessions instead). The account, the combination model, trades the
 lists of the models chosen for the year (every model whose trades beat SPY bought with the same dollars on the same
-dates, on the earlier years) from one capital; a year's return is its last equity over its starting capital, minus 1. SPY held with that capital,
-and SPY bought for every order, are the references. A test year's hyperparameters, exit strategies and
-combination are chosen on the test years before it only, by mean yearly return; the first test year runs the
-defaults and every model. The choice made on every test year is saved for the 2026 final test, which this never
+dates, on the earlier years) from one capital; a year's return is its last equity over its starting capital, minus
+1. SPY held with that capital, and SPY bought for every order, are the references. A test year's choices use the test years before it only:
+each model's hyperparameters and exit strategy by mean yearly return at the default 20 stocks a day, then how many
+stocks a day it lists by return per day (its profit over the dollars it had invested at each close, so idle cash
+never decides), then the combination; the first test year runs the defaults and every model. The idle cash
+earns nothing; the summary also shows each year's account and each model with it held in SPY, or in BIL
+(Treasury bills) for the interest. The choice made on every test year is saved for the 2026 final test, which this never
 runs, and the API serves it. Results go to artifacts/<label>/.
 
 Needs the as-traded bars, splits and dividends (2021-2025 only), downloaded once:
@@ -29,28 +32,12 @@ from stock_recommender.backtest.registry import MODELS  # noqa: E402
 from stock_recommender.backtest.report import format_summary, selection_table, write_run  # noqa: E402
 
 
-def ensemble(spec: str) -> tuple[str, tuple[tuple[str, float], ...]]:
-    """Parse NAME=MODEL:WEIGHT,MODEL:WEIGHT (weights default to 1)."""
-    name, _, members = spec.partition("=")
-    if not name or not members:
-        raise argparse.ArgumentTypeError(f"Expected NAME=MODEL:WEIGHT,MODEL:WEIGHT; got {spec!r}.")
-    parsed = []
-    for member in members.split(","):
-        model, _, weight = member.partition(":")
-        parsed.append((model.strip(), float(weight) if weight else 1.0))
-    return name, tuple(parsed)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     defaults = BacktestConfig()
     parser.add_argument("--models", nargs="*", default=list(defaults.models), choices=sorted(MODELS),
                         help="Models to backtest (backtest/registry.py); one with a grid there has its "
                              "hyperparameters chosen on earlier test years.")
-    parser.add_argument("--ensemble", action="append", type=ensemble, metavar="NAME=MODEL:W,MODEL:W",
-                        help="A weighted blend of models' scores, backtested as one more model; repeatable.")
-    parser.add_argument("--normalize", default=defaults.normalize, choices=["rank", "zscore", "none"],
-                        help="How an ensemble puts its members' scores on one scale.")
     parser.add_argument("--test-years", nargs="+", type=int, default=list(defaults.test_years),
                         help="Consecutive years within 2022-2025. Each is traded by models trained on all earlier "
                              "years, with hyperparameters chosen on the test years before it.")
@@ -76,8 +63,7 @@ def main():
     args = parser.parse_args()
     try:
         config = BacktestConfig(
-            models=tuple(args.models), ensembles=tuple(args.ensemble or ()), normalize=args.normalize,
-            test_years=tuple(args.test_years), offset=args.offset,
+            models=tuple(args.models), test_years=tuple(args.test_years), offset=args.offset,
             decide_every=None if args.back_to_back else args.decide_every, cost_bps=args.cost_bps,
             capital=args.capital, order_value=args.order_value, whole_shares=args.whole_shares,
             final_fit=not args.no_final_fit,

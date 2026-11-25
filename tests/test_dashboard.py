@@ -15,7 +15,7 @@ from stock_recommender.features import FEATURES
 from stock_recommender.models import load_models
 from stock_recommender.news_features import NEWS_FEATURES
 from .test_notify import TO, FakeSMTP
-from .test_served_models import make_run
+from .test_served_models import make_run, write_picks
 from .test_stock_recommender import TestClient, write_news
 
 DAYS = pd.bdate_range(end="2026-10-16", periods=65)  # More than the 60 sessions the price features read.
@@ -46,7 +46,7 @@ class MomentumModel:
 
 
 class MeasuredModel(MomentumModel):
-    """A momentum model that also reports importances, as a fitted forest would."""
+    """A momentum model that also reports importances, as a fitted model would."""
 
     def feature_importances(self):
         return {"ret_20d": 0.7, "volume_ratio": 0.3}
@@ -238,6 +238,32 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("2026 is reserved for the one final evaluation", page)
         for later in ("<th>2026</th>", "+90.0%", "99,999", "88,888"):
             self.assertNotIn(later, page)
+
+    def test_the_account_rule_and_the_served_models_traded_under_it_are_shown(self):
+        models = {"liquid": load_models(), "news": replace(load_models(), version="news")}
+        folder = make_run(self.root, models, capital=10_000.0, order_value=100.0)
+        write_picks(folder, {"liquid": 0.0010, "news": 0.0007})
+        self.client(model_run=str(folder)).get("/recommendations/latest")
+        self.assertIn("first sell news", self.snapshot()["lists"]["account"])
+        page = (self.board / "index.html").read_text(encoding="utf-8")
+        self.assertIn("<b>Account rule.</b> From $10,000, buy $100 of each stock to buy at today", page)
+        self.assertIn("run <code>scripts/account_rules.py</code>", page)  # Not computed for this run yet.
+        returns = {"make_room": ("Account, the served rule", {"2022": -0.334, "2025": 0.176, "2026": 0.9}),
+                   "skip": ("Account, the backtest's rule", {"2022": -0.288, "2025": 0.399, "2026": -0.5})}
+        (folder / "account_rules.json").write_text(json.dumps({
+            "years": [2022, 2025, 2026], "make_room": "news",
+            "strategies": {key: {"label": label, "return_by_year": by_year} for key, (label, by_year)
+                           in returns.items()}}), encoding="utf-8")
+        self.client(model_run=str(folder)).get("/recommendations/latest")
+        backtest = self.snapshot()["backtest"]["rules"]
+        self.assertEqual((backtest["years"], backtest["make_room"]), (["2022", "2025"], "news"))
+        page = (self.board / "index.html").read_text(encoding="utf-8")
+        self.assertIn("<b>Account, the served rule</b>", page)  # The rule the API states, in bold.
+        for shown in ("-33.4%", "+17.6%", "-7.9%"):  # Its mean over 2022-2025, not 2026's.
+            self.assertIn(shown, page)
+        for later in ("+90.0%", "-50.0%"):
+            self.assertNotIn(later, page)
+        self.assertNotIn("scripts/account_rules.py", page)
 
     def test_the_page_has_a_recommendations_tab_and_a_backtest_simulation_tab(self):
         folder = make_run(self.root, {"liquid": load_models()})

@@ -19,12 +19,9 @@ Never register load_models(): once it loads models trained on 2021-2025, a backt
 """
 from dataclasses import fields, replace
 from itertools import product
-from ..forest import ForestPriceModel
 from ..models import Models, placeholder_models
 from ..news_boost import NewsBoostModel
 from ..news_features import EXTENDED_LOOKBACK_DAYS
-from ..news_forest import NewsForestModel, news_blend
-from ..price_news_forest import PriceNewsForestModel
 
 MODEL_FIELDS = frozenset(field.name for field in fields(Models))
 
@@ -33,33 +30,6 @@ def most_liquid_models() -> Models:
     """Recommend the most liquid stocks: the price model expects no move for any stock, and equal scores rank the
     larger dollar volume first (recommend.score_day)."""
     return replace(placeholder_models(), version="most_liquid")
-
-
-def random_forest_models(min_samples_leaf: int = 1_000, max_features: float = 0.5) -> Models:
-    """Recommend the stocks a random forest on the ten daily-bar features expects to beat the others most over the
-    horizon (forest.py); no news. Its 20 best picks, held 5 sessions, from 60 sessions of bars."""
-    price = ForestPriceModel(min_samples_leaf=min_samples_leaf, max_features=max_features)
-    return replace(placeholder_models(), price=price,
-                   version=f"random_forest(min_samples_leaf={min_samples_leaf},max_features={max_features})")
-
-
-def news_forest_models(min_samples_leaf: int = 1_000, max_features: float = 0.5) -> Models:
-    """Recommend the stocks whose last 7 days of news a random forest on the eight news features rates best
-    (news_forest.py); no bars feature: its price model expects no move for any stock. Its 20 best picks among the
-    stocks with news, held 5 sessions."""
-    news = NewsForestModel(min_samples_leaf=min_samples_leaf, max_features=max_features)
-    return replace(placeholder_models(), news=news, blend=news_blend,
-                   version=f"news_forest(min_samples_leaf={min_samples_leaf},max_features={max_features})")
-
-
-def price_news_forest_models(min_samples_leaf: int = 1_000, max_features: float = 0.5) -> Models:
-    """Recommend the stocks a random forest on the ten daily-bar features and the eight news features together
-    expects to rank best over the horizon (price_news_forest.py). It is a joint model, which gives the score
-    itself: the price and news parts stay the placeholders. Its 20 best picks among every tradable stock, news or
-    not, held 5 sessions, from 60 sessions of bars and 7 days of news."""
-    joint = PriceNewsForestModel(min_samples_leaf=min_samples_leaf, max_features=max_features)
-    return replace(placeholder_models(), joint=joint,
-                   version=f"price_news_forest(min_samples_leaf={min_samples_leaf},max_features={max_features})")
 
 
 def news_boost_models(num_leaves: int = 7, min_child_samples: int = 2_000) -> Models:
@@ -71,15 +41,13 @@ def news_boost_models(num_leaves: int = 7, min_child_samples: int = 2_000) -> Mo
                    version=f"news_boost(num_leaves={num_leaves},min_child_samples={min_child_samples})")
 
 
-MODELS = {"most_liquid": most_liquid_models, "random_forest": random_forest_models,
-          "news_forest": news_forest_models, "price_news_forest": price_news_forest_models,
-          "news_boost": news_boost_models}
+MODELS = {"most_liquid": most_liquid_models, "news_boost": news_boost_models}
 
 # Every model's exit strategy (exits.py), tuned with its own hyperparameters. The defaults hold 5 trading days with
 # no early rule, as before exit settings existed. Settings that differ only here share one fit per year, so they
 # cost trading time, not training.
 EXITS = {
-    "hold_days": (5, 10, 20),  # Trading days to hold at most; the forests still learn 5-day returns.
+    "hold_days": (5, 10, 20),  # Trading days to hold at most, whatever horizon the model learns.
     "stop_loss": (None, 0.08),  # Sell after a close 8% below the entry price: the MAE limit.
     "take_profit": (None, 0.15),  # Sell after a close 15% above it: the MFE target.
     "volatility_exit": (None, 3.0),  # After a move of 3 daily volatilities, sell once a move is back within one.
@@ -89,12 +57,8 @@ EXITS = {
 # or 47 of the ~4,700 tradable stocks; news_boost ranks only those with news, 650-2,150 a day). Like the exit
 # settings, these share one fit per year.
 PICKS = {"picks": (20, 10, 5, "0.5%", "1%")}
-FOREST = {"min_samples_leaf": (1_000, 250), "max_features": (0.5, 1.0)}
 GRIDS: dict[str, dict] = {  # most_liquid has no hyperparameters of its own, only its exit strategy and picks.
     "most_liquid": {**EXITS, **PICKS},
-    "random_forest": {**FOREST, **EXITS, **PICKS},
-    "news_forest": {**FOREST, **EXITS, **PICKS},
-    "price_news_forest": {**FOREST, **EXITS, **PICKS},
     # It learns 20-session returns, so it holds 20 sessions by default.
     "news_boost": {"num_leaves": (7, 15), "min_child_samples": (2_000, 500), **EXITS, "hold_days": (20, 10, 5),
                    **PICKS},

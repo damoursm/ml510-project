@@ -63,7 +63,8 @@ class Panel:
         """Build the panel; without dividends_path, returns leave out dividends."""
         bars = store.read_bars()
         sessions = pd.DatetimeIndex(bars.date.unique())
-        if sessions.max().date() > LAST_DAY:
+        # The store's window: 2021-2025 for a backtest (only the 2026 final test's store ends later).
+        if sessions.max().date() > getattr(store, "last_day", LAST_DAY):
             raise LeakageError(f"Bars dated {sessions.max().date()} reached the backtest.")
         if strict_calendar:
             expected = {2021: 252, 2022: 251, 2023: 250, 2024: 252, 2025: 250}

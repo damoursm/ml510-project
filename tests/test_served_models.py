@@ -6,6 +6,7 @@ from pathlib import Path
 import pickle
 import shutil
 import uuid
+import pandas as pd
 from stock_recommender.backtest.report import write_run
 from stock_recommender.config import Settings
 from stock_recommender.models import RandomPriceModel
@@ -34,6 +35,17 @@ def make_run(root: Path, models: dict, manifest: dict | None = None, **fields) -
     manifest = manifest or {"configuration": {"offset": 0, "sentiment_dir": None}, "source_sha256": {}}
     (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return folder
+
+
+def write_picks(folder: Path, per_day: dict) -> None:
+    """Write the run's tables/picks.csv with each model's final choice at its return per day, plus rows the account
+    rule must not read: a list size not chosen, and an earlier year's choice."""
+    rows = [{"choice": "final", "model": name, "chosen": True, "tuning_return_per_day": value}
+            for name, value in per_day.items()]
+    rows += [{"choice": "final", "model": name, "chosen": False, "tuning_return_per_day": -1.0} for name in per_day]
+    rows += [{"choice": "2025", "model": name, "chosen": True, "tuning_return_per_day": -2.0} for name in per_day]
+    (folder / "tables").mkdir(exist_ok=True)
+    pd.DataFrame(rows).to_csv(folder / "tables" / "picks.csv", index=False)
 
 
 def edit_selection(folder: Path, change) -> None:
@@ -100,6 +112,28 @@ class SelectionTest(Store):
         self.assertIn("RECOMMENDER_MODEL_RUN is empty", load_selection("").error)
         (folder / "selection.json").write_text("{", encoding="utf-8")
         self.assertIn("cannot read", load_selection(str(folder)).error)
+
+    def test_the_account_rule_makes_room_with_the_model_that_earned_least_per_day(self):
+        models = {"liquid": small_models(), "news": small_models(version="news")}
+        folder = make_run(self.root, models, capital=10_000.0, order_value=100.0)
+        write_picks(folder, {"liquid": 0.0010, "news": 0.0007})
+        selection = load_selection(str(folder))
+        self.assertEqual((selection.make_room, selection.return_per_day),
+                         ("news", (("liquid", 0.0010), ("news", 0.0007))))
+        rule = selection.account_rule()
+        self.assertEqual((rule.capital, rule.order_value, rule.cost_bps, rule.make_room),
+                         (10_000.0, 100.0, 5.0, "news"))
+        self.assertIn("From $10,000, buy $100 of each stock to buy at today's close", rule.summary)
+        self.assertIn("first sell news's oldest trades, never one bought the same day", rule.summary)
+        # Without the run's measure, or with one model, there is no model to make room with: such an order is skipped.
+        (folder / "tables" / "picks.csv").unlink()
+        self.assertIsNone(load_selection(str(folder)).make_room)
+        self.assertIn("When an order finds no cash, skip it.", load_selection(str(folder)).account_rule().summary)
+        alone = make_run(self.root, {"liquid": small_models()}, capital=10_000.0, order_value=100.0)
+        write_picks(alone, {"liquid": 0.0010})
+        self.assertIsNone(load_selection(str(alone)).make_room)
+        # A run that records no account states no rule.
+        self.assertIsNone(load_selection(str(make_run(self.root, models))).account_rule())
 
     def test_the_choice_the_final_test_evaluated_is_still_served(self):
         # The 2026 test measures the combination the API serves; it does not retire it.

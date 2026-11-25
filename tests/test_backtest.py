@@ -128,6 +128,48 @@ class WindowGuardTest(Store):
                 module.main()
         run.assert_not_called()
 
+    def test_only_the_final_test_store_reads_2026(self):
+        from stock_recommender.final_test import FinalTestStore  # Never imported by the backtest (test below).
+        later = self.prices["open"].iloc[-2:].set_axis([pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05")])
+        write_bars(self.root / "bars", later)
+        write_splits(self.root / "splits_2026.parquet", [("T001", "2026-01-05", 1, 2)])
+        backtest = WindowedStore(self.root / "bars", self.root / "news", self.root / "splits.parquet")
+        final = FinalTestStore(self.root / "bars", self.root / "news",
+                               (self.root / "splits.parquet", self.root / "splits_2026.parquet"))
+        self.assertEqual(backtest.read_bars().date.max(), pd.Timestamp("2025-03-31"))  # Its 2026 folder is unlisted.
+        self.assertEqual(final.read_bars().date.max(), pd.Timestamp("2026-01-05"))
+        self.assertEqual(list(final.read_splits().ticker), ["T001"])  # Both files, the 2021-2025 one empty here.
+        self.assertEqual(Panel.load(final, strict_calendar=False).sessions[-1], pd.Timestamp("2026-01-05"))
+        self.assertEqual(Panel.load(backtest, strict_calendar=False).sessions[-1], pd.Timestamp("2025-03-31"))
+        with self.assertRaisesRegex(LeakageError, "outside"):  # The backtest's store refuses 2026's splits.
+            WindowedStore(self.root / "bars", self.root / "news", self.root / "splits_2026.parquet").read_splits()
+        write_bars(self.root / "bars", later.iloc[:1].set_axis([pd.Timestamp("2027-01-04")]))
+        self.assertEqual(final.read_bars().date.max(), pd.Timestamp("2026-01-05"))  # Nor does it go past 2026.
+        self.assertEqual((WindowedStore.last_day, FinalTestStore.last_day), (date(2025, 12, 31), date(2026, 12, 31)))
+
+    def test_the_final_test_checks_its_data_against_the_backtests(self):
+        from stock_recommender.final_test import FinalTestStore, _same_history
+        settings = config(self.root)
+
+        def final_data(bars: Path):
+            store = FinalTestStore(bars, settings.news_dir, (settings.splits_path,))
+            return Panel.load(store, False), store.read_news()
+
+        later = self.prices["open"].iloc[-2:].set_axis([pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05")])
+        with self.assertRaisesRegex(RuntimeError, "no 2026 sessions"):
+            _same_history(settings, *final_data(self.root / "bars"))
+        write_bars(self.root / "bars", later)
+        self.assertTrue(_same_history(settings, *final_data(self.root / "bars")).empty)  # The same 2021-2025.
+        shutil.copytree(self.root / "bars", self.root / "other")
+        (self.root / "other/2025/2025-01-02.parquet").unlink()  # A 2025 day gone: not the backtest's history.
+        with self.assertRaisesRegex(RuntimeError, "sessions"):
+            _same_history(settings, *final_data(self.root / "other"))
+        moved = self.prices["open"].loc[["2025-03-28"]] * 1.5  # One day's prices, every stock: far more than 1%.
+        write_bars(self.root / "other", moved)
+        write_bars(self.root / "other", self.prices["open"].loc[["2025-01-02"]])
+        with self.assertRaisesRegex(RuntimeError, "other 2021-2025 values"):
+            _same_history(settings, *final_data(self.root / "other"))
+
     def test_holdings_never_end_after_the_last_session(self):
         data = load_data(config(self.root))
         panel = data[1]
@@ -148,8 +190,9 @@ class WindowGuardTest(Store):
         forbidden_imports = {"read_bars", "read_news", "recent_day_files", "load_models"}
         forbidden_modules = {"requests", "httpx", "urllib", "duckdb", "socket"}
         # The models the API serves were fit on the test years; nothing here may reach them, by any import form:
-        # from ..served_models import x, stock_recommender.served_models, from .. import served_models.
-        served_modules = {"served_models"}
+        # from ..served_models import x, stock_recommender.served_models, from .. import served_models. Nor the 2026
+        # final test, whose store reads 2026.
+        served_modules = {"served_models", "final_test"}
         for path in BACKTEST.glob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -409,12 +452,11 @@ class EngineTest(Store):
     def test_a_run_reports_every_strategy_and_benchmark(self):
         result = self.run_backtest(models=("flat", "random"), factories={
                                        "flat": small_models, "random": lambda: small_models(price=RandomPriceModel(3))},
-                                   ensembles=(("mix", (("flat", 1.0), ("random", 2.0))),), null_seeds=3)
+                                   null_seeds=3)
         self.assertEqual(list(result.profit.columns),
-                         ["flat", "random", "mix", "account", "spy_hold", "spy_mirror", "universe_ew"])
+                         ["flat", "random", "account", "spy_hold", "spy_mirror", "universe_ew"])
         self.assertEqual(set(result.metrics.scope), {"all", "2025"})
-        self.assertEqual(len(result.null), 3 * 3)  # Three seeds per model.
-        self.assertIn("ensemble(", result.versions["mix"])
+        self.assertEqual(len(result.null), 3 * 2)  # Three seeds per model.
         flat = result.positions[result.positions.strategy == "flat"]
         first = flat[flat.decision_date == flat.decision_date.min()]
         self.assertEqual(len(first), 2)  # picks=2 with constant scores: the two most liquid tickers.
@@ -425,8 +467,8 @@ class EngineTest(Store):
         self.assertTrue(set(HOLDING_COLUMNS) <= set(held.columns))
         self.assertAlmostEqual(held.net_profit.sum(), result.profit.flat.iloc[-1])  # Every cost is a holding's.
         self.assertIn("daily_return", result.metrics)
-        self.assertEqual(set(result.scores.candidate), {"flat", "random", "mix"})
-        self.assertEqual(set(result.orders.model), {"flat", "random", "mix"})  # The account trades every list.
+        self.assertEqual(set(result.scores.candidate), {"flat", "random"})
+        self.assertEqual(set(result.orders.model), {"flat", "random"})  # The account trades every list.
 
 
 class ReviewFindingsTest(Store):
@@ -501,22 +543,6 @@ class ReviewFindingsTest(Store):
         self.assertEqual(set(bars[bars.ticker == "PENNY"].close), {3.0})  # The split comes after the cutoff.
         self.assertEqual(snapshot.as_of, cutoff - pd.offsets.BDay(5))
         self.assertEqual(snapshot.bars.date.max(), snapshot.as_of)
-
-    def test_ensemble_weights_reach_the_trades(self):
-        tickers = [f"T{i:03d}" for i in range(self.tickers)]
-        up = {ticker: i for i, ticker in enumerate(tickers)}
-        down = {ticker: -i for i, ticker in enumerate(tickers)}
-        factories = {"up": lambda: small_models(price=FixedPriceModel(up)),
-                     "down": lambda: small_models(price=FixedPriceModel(down))}
-
-        def picks(result, name):
-            held = result.positions[result.positions.strategy == name]
-            return held.groupby("decision_date").ticker.apply(frozenset)
-
-        for heavy, light in (("up", "down"), ("down", "up")):
-            result = self.run_backtest(factories, models=("up", "down"),
-                                       ensembles=(("mix", ((heavy, 3.0), (light, 1.0))),))
-            pd.testing.assert_series_equal(picks(result, "mix"), picks(result, heavy), check_names=False)
 
     def test_trading_options_reach_the_trades(self):
         free = self.run_backtest(models=("flat",))
@@ -616,13 +642,13 @@ class ReviewFindingsTest(Store):
         spec = importlib.util.spec_from_file_location("backtest_cli", ROOT / "scripts/backtest.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for argv, ensembles in ((["--models", "most_liquid"], ()), ([], BacktestConfig().ensembles)):
+        for argv, models in ((["--models", "most_liquid"], ("most_liquid",)), ([], BacktestConfig().models)):
             with (mock.patch.object(sys, "argv", ["backtest.py", *argv]),
                   mock.patch.object(module, "run_backtest", side_effect=ValueError("stop")) as run,
                   redirect_stderr(io.StringIO())):
                 with self.assertRaises(SystemExit):
                     module.main()
-            self.assertEqual(run.call_args.args[0].ensembles, ensembles)
+            self.assertEqual(run.call_args.args[0].models, models)
 
 
 class PointInTimeInputsTest(unittest.TestCase):
@@ -869,8 +895,7 @@ class IsolationTest(Store):
             self.assertTrue(all(cell.base is None for cell in cells if isinstance(cell, np.ndarray)))
 
     def test_strategy_names_must_be_unique_and_not_benchmarks(self):
-        for changes in ({"ensembles": (("spy_hold", (("flat", 1.0),)),)},
-                        {"ensembles": (("flat", (("flat", 1.0),)),)}):
+        for changes in ({"models": ("spy_hold",)}, {"models": ("flat", "flat")}):
             with self.assertRaises(ValueError):
                 config(self.root, **changes)
 

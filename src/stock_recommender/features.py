@@ -1,8 +1,9 @@
-"""Ten features of each stock from its daily OHLCV bars, for a price model such as a random forest.
+"""Ten features of each stock from its daily OHLCV bars: what the dashboard's explanations read (explain.py), and
+what a new price model can train on.
 
 A stock's features on decision day t use only its bars through t's close, counted in trading sessions: ret_5d
 compares t's close with the close 5 sessions earlier. A feature is NaN when a bar it reads is missing (a halt, a
-recent listing, a window shorter than LOOKBACK); scikit-learn's random forests accept NaN. Prices are compared on one
+recent listing, a window shorter than LOOKBACK); tree models such as LightGBM accept NaN. Prices are compared on one
 split basis, so a split changes no feature. Every feature but dollar_volume_20d is a ratio of prices or of volumes,
 which the price level does not change; dollar_volume_20d is the log of the dollars traded. Dividends are not added
 back, as in the split-adjusted bars PriceModel.predict receives.

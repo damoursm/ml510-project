@@ -8,7 +8,8 @@ GET /recommendations/latest returns the stocks to buy and sell at today's close 
 same after optionally fetching new data (fetch=true) and before optionally emailing the lists to the given
 addresses (email=you@example.com). The API runs nothing on its own: every weekday at 16:00 the email task
 (scripts/email_recommendations.py) calls it with both. With RECOMMENDER_MODEL_RUN set, the lists come from that
-backtest run's final selection, the best combination of models (served_models.py), instead of load_models().
+backtest run's final selection, the best combination of models (served_models.py), instead of load_models(), and
+`account` says how an account trades them (Selection.account_rule): the API keeps no account itself.
 GET /dashboard shows the page that every call of the recommendations writes again (dashboard.py).
 """
 from contextlib import asynccontextmanager
@@ -171,6 +172,7 @@ class RunRecommendations(LatestRecommendations):
             generated_at=generated_at,
             horizon_days=max(exit_rule(model.models).hold_days for model in served),
             exits={model.name: exit_strategy(model.models) for model in served},
+            account=self.selection().account_rule(),
             model_version=" + ".join(dict.fromkeys(model.version for model in served)),
             universe_size=max(result.universe_size for _, result in results),
             buy=buy,

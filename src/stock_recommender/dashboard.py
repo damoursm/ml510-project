@@ -32,6 +32,8 @@ HISTORY = 30  # Calls the page lists.
 PROFILE = 5  # A model's strongest drivers shown beside each listed stock.
 SHOWN = 6  # Hovering a stock shows its strongest features by SHAP and by LIME, this many of each.
 PROFIT_POINTS = 260  # Most points per line of the profit chart.
+# Beside a run: its final choice traded under the served account rule, and the backtest's (scripts/account_rules.py).
+ACCOUNT_RULES = "account_rules.json"
 STRATEGIES = {"account": "Account (the picks of the models chosen each year)", "spy_hold": "SPY, held",
               "spy_mirror": "SPY, bought with each order", "universe_ew": "All tradable stocks, equal weight"}
 METRICS = {  # metrics.csv column: (label, format, explanation).
@@ -322,6 +324,7 @@ def _lists(body: RecommendationList) -> dict:
             "news_through": body.news_through.isoformat() if body.news_through else None,
             "generated_at": body.generated_at.isoformat(), "horizon_days": body.horizon_days,
             "exits": {name: strategy.summary for name, strategy in body.exits.items()},
+            "account": body.account.summary if body.account else None,
             "model_version": body.model_version, "universe_size": body.universe_size, "run": body.run,
             "models": models}
 
@@ -401,7 +404,7 @@ def backtest_results(run: str) -> dict:
     folder = Path(run) if Path(run).is_absolute() else ROOT / run
     tables = folder / "tables"
     results = {"run": run, "missing": [], "models": [], "chosen_on_years": [], "strategies": [], "years": [],
-               "yearly": {}, "profit": None}
+               "yearly": {}, "profit": None, "rules": None}
     try:
         selection = json.loads((folder / "selection.json").read_text(encoding="utf-8"))
         results["models"] = [str(name) for name in selection.get("models") or {}]
@@ -428,7 +431,30 @@ def backtest_results(run: str) -> dict:
             results["profit"] = {"dates": sample.date.astype(str).tolist(),
                                  "series": {str(column): [_number(value) for value in sample[column]]
                                             for column in profit.columns if column != "date"}}
+    results["rules"] = account_rules(folder / ACCOUNT_RULES, results["missing"])
     return results
+
+
+def account_rules(path: Path, missing: list) -> dict | None:
+    """The run's final choice traded under the served account rule and the backtest's (scripts/account_rules.py):
+    each strategy's return per test year before TEST_YEAR and their mean. None, and listed as missing when present
+    but unreadable, when the file is not there."""
+    if not path.is_file():
+        return None
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        years = [str(year) for year in saved.get("years") or [] if int(year) < TEST_YEAR]
+        strategies = []
+        for key, item in (saved.get("strategies") or {}).items():
+            returns = item.get("return_by_year") or {}
+            shown = [returns.get(year) for year in years]
+            strategies.append({"key": str(key), "label": str(item.get("label") or key),
+                               **{year: _number(value) for year, value in zip(years, shown)},
+                               "mean": _number(sum(shown) / len(shown)) if shown and None not in shown else None})
+        return {"years": years, "make_room": saved.get("make_room"), "strategies": strategies}
+    except (OSError, ValueError, TypeError, AttributeError):
+        missing.append(path.name)
+        return None
 
 
 # ---- The page ----
@@ -624,6 +650,8 @@ def _lists_section(snapshot: dict) -> str:
              f'its value of the features its model\'s ranking follows most, with its percentile among the '
              f'{lists["universe_size"]:,} tradable stocks (p99: higher than 99% of them). Hover over a stock, or Tab '
              f'to it, for its SHAP and LIME values: how much each feature moves it up or down the ranking.</p>']
+    if lists.get("account"):  # How an account trades the buys; the API keeps none.
+        parts.append(f'<p class="note"><b>Account rule.</b> {escape(lists["account"])}</p>')
     if explanation.get("error"):
         parts.append(f'<p class="banner bad">The lists are not explained: {escape(explanation["error"])}.</p>')
     for name, sides in lists["models"].items():
@@ -746,6 +774,24 @@ def _backtest_section(backtest: dict | None) -> str:
                        for strategy, returns in backtest["yearly"].items())
         parts.append(f'<b>Return each year</b> <span class="meta">(profit over the starting capital)</span>'
                      f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
+    rules = backtest.get("rules")
+    if rules and rules["strategies"]:
+        head = "".join(f"<th>{escape(year)}</th>" for year in rules["years"]) + "<th>Mean</th>"
+        rows = []
+        for row in rules["strategies"]:
+            label = escape(row["label"])
+            label = f"<b>{label}</b>" if row["key"] == "make_room" else label  # The rule the API states.
+            cells = "".join(f"<td>{_format(row.get(year), 'signed')}</td>" for year in rules["years"] + ["mean"])
+            rows.append(f'<tr><td class="text">{label}</td>{cells}</tr>')
+        rows = "".join(rows)
+        parts.append('<b>The served models traded together, under the served account rule</b> <span class="meta">'
+                     '(one $10,000 account a year; each year from models fit on the years before it, but these '
+                     'models were chosen on these years, so this is in sample)</span>'
+                     f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
+    elif len(backtest["models"]) > 1:
+        parts.append('<p class="note">The served models traded together under the served account rule are not '
+                     f'computed for this run: run <code>scripts/account_rules.py</code> (it writes '
+                     f'<code>{ACCOUNT_RULES}</code> beside the run).</p>')
     if backtest["profit"]:
         parts.append(f'<b>Cumulative profit</b><div class="scroll">{profit_chart(backtest["profit"], names)}</div>')
     if backtest["missing"]:
