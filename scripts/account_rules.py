@@ -1,5 +1,5 @@
 """Trade a backtest run's final choice in each of its test years under the served account rule, and save it beside the
-run as account_rules.json, which the dashboard shows (dashboard.py ACCOUNT_RULES).
+run as account_rules.json: the final test compares its replay of the served rule in 2025 with it (final_test.py).
 
 The served account rule (served_models.py, account.trade make_room) is the backtest's account with one change: an
 order the cash does not cover first sells the oldest open trades of the served model with the worst return per day,
@@ -40,10 +40,10 @@ from stock_recommender.backtest.registry import GRIDS, MODELS  # noqa: E402
 from stock_recommender.backtest.run import (BacktestConfig, _candidates, _fit, _per_day, _trade_year,  # noqa: E402
                                             load_data, walk_forward)
 from stock_recommender.config import Settings  # noqa: E402
-from stock_recommender.dashboard import ACCOUNT_RULES  # noqa: E402
 
 TOLERANCE = 1e-9  # Of a replayed yearly return against the run's.
 IDLE = "SPY"  # Where the *_spy strategies hold their idle cash.
+ACCOUNT_RULES = "account_rules.json"  # Written beside the run; final_test.py reads it under the same name.
 SETTINGS = ("test_years", "cost_bps", "capital", "order_value", "whole_shares", "min_price", "min_dollar_volume",
             "decide_every", "offset", "sentiment_model")
 

@@ -76,8 +76,12 @@ class EmailTest(unittest.TestCase):
         text = message.get_body("plain").get_content()
         self.assertLess(text.index("BUY"), text.index("BIG"))
         self.assertLess(text.index("SELL"), text.index("DUD"))
-        self.assertIn("-4.00%", text)
-        self.assertIn("<td align=\"right\">DUD</td>", message.get_body("html").get_content())
+        rows = [line.split() for line in text.splitlines()]
+        self.assertEqual(rows.count(["#", "Ticker", "News", "Close"]), 2)  # No score, expected return or sentiment.
+        self.assertNotIn("-4.00%", text)
+        html = message.get_body("html").get_content()
+        self.assertIn("<td align=\"right\">DUD</td>", html)
+        self.assertEqual(html.count("<th>"), 8)
 
     def test_no_email_unless_asked(self):
         self.assertIsNone(self.post()["email"])
@@ -194,7 +198,7 @@ class RunEmailTest(unittest.TestCase):
         self.assertIn(["1", "flipped", "DUD"], rows)
         self.assertIn("<th>Model</th>", FakeSMTP.sent[0].get_body(("html",)).get_content())
 
-    def test_the_lists_and_the_email_state_the_account_rule(self):
+    def test_the_lists_state_the_account_rule_and_the_email_does_not(self):
         models = {"fixed": self.fixed({"BIG": 0.02, "DUD": -0.04}, "fixed"),
                   "flipped": self.fixed({"BIG": -0.01, "DUD": 0.01}, "flipped")}
         folder = make_run(Path(self.directory.name), models, capital=10_000.0, order_value=100.0)
@@ -205,10 +209,9 @@ class RunEmailTest(unittest.TestCase):
         self.assertEqual({key: body["account"][key] for key in ("capital", "order_value", "cost_bps", "make_room")},
                          {"capital": 10_000.0, "order_value": 100.0, "cost_bps": 5.0, "make_room": "flipped"})
         self.assertEqual(len(body["buy"]), 2)  # The lists themselves are the models' as before.
-        text = FakeSMTP.sent[0].get_body(("plain",)).get_content()
-        self.assertIn("Account rule: From $10,000, buy $100 of each stock to buy at today's close", text)
-        self.assertIn("When an order finds no cash, first sell flipped's oldest trades", text)
-        self.assertIn("Account rule: From $10,000", FakeSMTP.sent[0].get_body(("html",)).get_content())
+        self.assertIn("When an order finds no cash, first sell flipped's oldest trades", body["account"]["summary"])
+        self.assertNotIn("Account rule", FakeSMTP.sent[0].get_body(("plain",)).get_content())
+        self.assertNotIn("Account rule", FakeSMTP.sent[0].get_body(("html",)).get_content())
 
 
 if __name__ == "__main__":

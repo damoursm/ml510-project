@@ -1,13 +1,11 @@
-"""The dashboard: a page that explains the API's recommendations, written again at every call. It has two tabs: the
-recommendations (the lists, what drives each model's ranking, the calls) and the backtest simulation of the served run.
-Hovering a listed stock shows its SHAP and LIME values (explain.py), from data the page carries as JSON.
+"""The dashboard: a page that explains the API's recommendations, written again at every call: the lists, what drives
+each model's ranking, and the calls. Hovering a listed stock shows its SHAP and LIME values (explain.py), from data the
+page carries as JSON.
 
 Every GET or POST of /recommendations/latest, by hand or by the 16:00 email task, is recorded (Dashboard.record): the
 lists it returned, how the fetch and the email went (counts, never the addresses), and the explanation of the lists
 (explain.py): what each model's ranking follows, and where the listed stocks stand on those features. A call that
-fails is recorded with its error, and the page keeps the last lists. The page also shows the served backtest run's
-out-of-sample results, 2022-2025, from the run's tables. It never shows how the recommendations did in 2026: that year
-is reserved for the one final evaluation.
+fails is recorded with its error, and the page keeps the last lists.
 
 The files, in settings.dashboard_dir: index.html, the page (served at /dashboard, and readable without the API);
 latest.json, the last call that returned lists, with their explanation; calls.jsonl, one line per call.
@@ -22,31 +20,15 @@ from pathlib import Path
 import threading
 import time
 import pandas as pd
-from .config import ROOT, Settings
+from .config import Settings
 from .explain import DESCRIPTIONS, OUTPUTS, explain, local_explanations
 from .schemas import RecommendationList
-from .served_models import TEST_YEAR
 
 log = logging.getLogger("uvicorn.error")
 HISTORY = 30  # Calls the page lists.
 PROFILE = 5  # A model's strongest drivers shown beside each listed stock.
 SHOWN = 6  # Hovering a stock shows its strongest features by SHAP and by LIME, this many of each.
-PROFIT_POINTS = 260  # Most points per line of the profit chart.
-# Beside a run: its final choice traded under the served account rule, and the backtest's (scripts/account_rules.py).
-ACCOUNT_RULES = "account_rules.json"
-STRATEGIES = {"account": "Account (the picks of the models chosen each year)", "spy_hold": "SPY, held",
-              "spy_mirror": "SPY, bought with each order", "universe_ew": "All tradable stocks, equal weight"}
-METRICS = {  # metrics.csv column: (label, format, explanation).
-    "mean_yearly_return": ("Mean yearly return", "signed", "Profit over the starting capital, averaged over the years"),
-    "sharpe": ("Sharpe", "ratio", "Mean daily return over its standard deviation, annualized"),
-    "max_drawdown": ("Max drawdown", "signed", "Largest fall from a peak of the account's value"),
-    "period_hit_rate": ("Profitable periods", "share", "Share of holding periods that made money"),
-    "ic_mean": ("IC", "ic", "Mean rank correlation of the scores with the returns that followed"),
-    "spread_mean": ("Top-bottom spread", "signed", "Mean return of the best-ranked stocks minus the worst"),
-    "excess_return_vs_spy_hold": ("vs SPY held", "signed", "Mean yearly return minus SPY's, held"),
-    "null_return_percentile": ("Beats random picks", "share", "Share of random lists of the same size it beats"),
-}
-COLORS = ["#2f81f7", "#e8912d", "#a371f7", "#3fb950", "#db61a2", "#8b949e", "#2bb6b0", "#d29922"]
+RANKED_BY = ("score", "dollar_volume")  # The outputs the drivers section correlates with the ranking.
 CSS = """
 :root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --card: #f6f8fa; --pos: #1a7f37;
         --neg: #cf222e; --accent: #0969da; }
@@ -74,14 +56,6 @@ th { color: var(--muted); font-weight: 600; vertical-align: bottom; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 4px 28px; }
 svg text { fill: var(--fg); font-size: 11px; } svg .muted { fill: var(--muted); }
 svg .axis { stroke: var(--line); } svg .up { fill: var(--pos); } svg .down { fill: var(--neg); }
-.tabs { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
-.tabs button { margin-bottom: -1px; padding: 8px 16px; border: 1px solid transparent; border-bottom: none;
-               border-radius: 6px 6px 0 0; background: none; color: var(--muted); font: inherit; font-weight: 600;
-               cursor: pointer; }
-.tabs button:hover { color: var(--fg); }
-.tabs button[aria-selected="true"] { color: var(--fg); background: var(--bg); border-color: var(--line); }
-.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.panel > section:first-child > h2 { margin-top: 20px; }
 tr[data-ticker] { cursor: help; }
 tr[data-ticker]:hover, tr[data-ticker]:focus { background: var(--card); outline: none; }
 .tip { position: fixed; z-index: 10; max-width: 660px; padding: 10px 12px; border: 1px solid var(--line);
@@ -93,30 +67,9 @@ tr[data-ticker]:hover, tr[data-ticker]:focus { background: var(--card); outline:
 .bar i { position: absolute; top: 1px; bottom: 1px; border-radius: 2px; }
 .bar i.up { background: var(--pos); } .bar i.down { background: var(--neg); }
 """
-# The tabs: (name, label). A tab's name is its address (#backtest), so a reload keeps it; no element has it as id,
-# so choosing a tab never scrolls the page.
-TABS = (("recommendations", "Recommendations"), ("backtest", "Backtest simulation"))
 SCRIPT = """<script>
 (function () {
-  var tabs = document.querySelectorAll("[data-tab]");
   var tip = document.getElementById("tip");
-  function show(name) {
-    if (!document.getElementById("panel-" + name)) { name = tabs[0].getAttribute("data-tab"); }
-    tabs.forEach(function (tab) {
-      var mine = tab.getAttribute("data-tab") === name;
-      tab.setAttribute("aria-selected", mine ? "true" : "false");
-      document.getElementById("panel-" + tab.getAttribute("data-tab")).hidden = !mine;
-    });
-    tip.hidden = true;
-  }
-  tabs.forEach(function (tab) {
-    tab.addEventListener("click", function () {
-      var name = tab.getAttribute("data-tab");
-      try { history.replaceState(null, "", "#" + name); } catch (error) { }
-      show(name);
-    });
-  });
-  show(location.hash.slice(1));
   setTimeout(function () { location.reload(); }, 60000);
 
   // Hovering a stock, or focusing it with Tab, shows its SHAP and LIME values.
@@ -200,7 +153,6 @@ class Dashboard:
         self._lock = threading.Lock()
         self._explained = None  # (generated_at, explanation, error) of the last result explained.
         self._local: dict = {}  # That result's SHAP and LIME values shown on hover, by (model, ticker).
-        self._backtests: dict[str, dict] = {}  # A run's tables, read once: they never change.
 
     def record(self, method: str, limit: int, body: RecommendationList | None = None, served: list | None = None,
                error: str | None = None, fetch: bool = False, email: bool = False) -> None:
@@ -229,8 +181,7 @@ class Dashboard:
     def _snapshot(self, call: dict, body: RecommendationList, served: list | None) -> dict:
         lists = _lists(body)
         explained, problem = self._explanation(body, served)
-        return {"call": call, "lists": lists, "explanation": _explanation(explained, problem, lists, self._local),
-                "backtest": self._backtest(body.run)}
+        return {"call": call, "lists": lists, "explanation": _explanation(explained, problem, lists, self._local)}
 
     def _explanation(self, body: RecommendationList, served: list | None):
         """The explanation of the result behind body, computed once per result: (explanation, error)."""
@@ -245,13 +196,6 @@ class Dashboard:
             explained, problem = None, f"{type(error).__name__}: {error}"
         self._explained, self._local = (body.generated_at, explained, problem), {}
         return explained, problem
-
-    def _backtest(self, run: str | None) -> dict | None:
-        if not run:
-            return None
-        if run not in self._backtests:
-            self._backtests[run] = backtest_results(run)
-        return self._backtests[run]
 
     def _last(self) -> dict | None:
         try:
@@ -324,7 +268,6 @@ def _lists(body: RecommendationList) -> dict:
             "news_through": body.news_through.isoformat() if body.news_through else None,
             "generated_at": body.generated_at.isoformat(), "horizon_days": body.horizon_days,
             "exits": {name: strategy.summary for name, strategy in body.exits.items()},
-            "account": body.account.summary if body.account else None,
             "model_version": body.model_version, "universe_size": body.universe_size, "run": body.run,
             "models": models}
 
@@ -389,74 +332,6 @@ def _summary(lists: dict) -> dict:
             "sell": {name: [item["ticker"] for item in sides["sell"][:5]] for name, sides in lists["models"].items()}}
 
 
-def _read_csv(path: Path, missing: list) -> pd.DataFrame | None:
-    try:
-        return pd.read_csv(path)
-    except (OSError, ValueError):
-        missing.append(path.name)
-        return None
-
-
-def backtest_results(run: str) -> dict:
-    """Return a backtest run's out-of-sample results from its tables: each strategy's metrics over all its test years
-    (metrics.csv), its return each year (yearly.csv) and its cumulative profit (profit.csv). Nothing of TEST_YEAR or
-    later is kept, though a served run never holds any."""
-    folder = Path(run) if Path(run).is_absolute() else ROOT / run
-    tables = folder / "tables"
-    results = {"run": run, "missing": [], "models": [], "chosen_on_years": [], "strategies": [], "years": [],
-               "yearly": {}, "profit": None, "rules": None}
-    try:
-        selection = json.loads((folder / "selection.json").read_text(encoding="utf-8"))
-        results["models"] = [str(name) for name in selection.get("models") or {}]
-        results["chosen_on_years"] = [int(year) for year in selection.get("chosen_on_years") or []]
-    except (OSError, ValueError, TypeError):
-        results["missing"].append("selection.json")
-    metrics = _read_csv(tables / "metrics.csv", results["missing"])
-    if metrics is not None and {"strategy", "scope"} <= set(metrics.columns):
-        for row in metrics[metrics.scope.astype(str) == "all"].to_dict("records"):
-            results["strategies"].append({"strategy": str(row["strategy"]),
-                                          **{key: _number(row.get(key)) for key in METRICS}})
-    yearly = _read_csv(tables / "yearly.csv", results["missing"])
-    if yearly is not None and "strategy" in yearly:
-        results["years"] = [column for column in yearly.columns if column.isdigit() and int(column) < TEST_YEAR]
-        results["yearly"] = {str(row["strategy"]): {year: _number(row.get(year))
-                                                    for year in results["years"] + ["mean"]}
-                             for row in yearly.to_dict("records")}
-    profit = _read_csv(tables / "profit.csv", results["missing"])
-    if profit is not None and "date" in profit:
-        profit = profit[profit.date.astype(str) < f"{TEST_YEAR}-01-01"].reset_index(drop=True)
-        if len(profit):
-            step = max(1, math.ceil(len(profit) / PROFIT_POINTS))
-            sample = profit.iloc[sorted(set(range(0, len(profit), step)) | {len(profit) - 1})]
-            results["profit"] = {"dates": sample.date.astype(str).tolist(),
-                                 "series": {str(column): [_number(value) for value in sample[column]]
-                                            for column in profit.columns if column != "date"}}
-    results["rules"] = account_rules(folder / ACCOUNT_RULES, results["missing"])
-    return results
-
-
-def account_rules(path: Path, missing: list) -> dict | None:
-    """The run's final choice traded under the served account rule and the backtest's (scripts/account_rules.py):
-    each strategy's return per test year before TEST_YEAR and their mean. None, and listed as missing when present
-    but unreadable, when the file is not there."""
-    if not path.is_file():
-        return None
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        years = [str(year) for year in saved.get("years") or [] if int(year) < TEST_YEAR]
-        strategies = []
-        for key, item in (saved.get("strategies") or {}).items():
-            returns = item.get("return_by_year") or {}
-            shown = [returns.get(year) for year in years]
-            strategies.append({"key": str(key), "label": str(item.get("label") or key),
-                               **{year: _number(value) for year, value in zip(years, shown)},
-                               "mean": _number(sum(shown) / len(shown)) if shown and None not in shown else None})
-        return {"years": years, "make_room": saved.get("make_room"), "strategies": strategies}
-    except (OSError, ValueError, TypeError, AttributeError):
-        missing.append(path.name)
-        return None
-
-
 # ---- The page ----
 
 def _et(stamp: str | None, form: str = "%Y-%m-%d %H:%M") -> str:
@@ -467,7 +342,7 @@ def _et(stamp: str | None, form: str = "%Y-%m-%d %H:%M") -> str:
 
 
 def _format(value, form: str) -> str:
-    """A number for the page: signed and share as percents, ratio and ic as decimals, money in dollars."""
+    """A number for the page: signed and share as percents, sentiment and ratio as decimals, money in dollars."""
     value = _number(value)
     if value is None:
         return '<span class="muted">—</span>'
@@ -477,10 +352,6 @@ def _format(value, form: str) -> str:
         text, sign = f"{value:.0%}", 0
     elif form == "money":
         text, sign = _money(value), 0
-    elif form == "ic":
-        text, sign = f"{value:+.3f}", value
-    elif form == "score":
-        text, sign = f"{value:.4f}", 0
     elif form == "sentiment":
         text, sign = f"{value:+.2f}", value
     else:
@@ -560,49 +431,6 @@ def driver_chart(drivers: list[dict]) -> str:
     return "".join(parts) + "</svg>"
 
 
-def profit_chart(profit: dict, names: dict) -> str:
-    """A line per strategy: its cumulative profit over the test years."""
-    dates, series = profit["dates"], profit["series"]
-    width, height, left, right, top, bottom = 860, 270, 70, 300, 10, 26
-    plot_width, plot_height = width - left - right, height - top - bottom
-    values = [value for points in series.values() for value in points if value is not None] + [0.0]
-    low, high = min(values), max(values)
-    span = (high - low) or 1.0
-
-    def x(index):
-        return left + plot_width * index / max(len(dates) - 1, 1)
-
-    def y(value):
-        return top + plot_height * (high - value) / span
-
-    parts = [f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" '
-             f'aria-label="Cumulative profit of each strategy">']
-    for value in sorted({low, 0.0, high}):
-        label = f"-${-value:,.0f}" if value < 0 else f"${value:,.0f}"
-        parts.append(f'<line class="axis" x1="{left}" y1="{y(value):.1f}" x2="{left + plot_width}" y2="{y(value):.1f}"/>'
-                     f'<text class="muted" x="{left - 6}" y="{y(value) + 4:.1f}" text-anchor="end">'
-                     f'{escape(label)}</text>')
-    years: dict[str, int] = {}
-    for index, day in enumerate(dates):
-        years.setdefault(day[:4], index)
-    for year, index in years.items():
-        parts.append(f'<line class="axis" x1="{x(index):.1f}" y1="{top}" x2="{x(index):.1f}" y2="{top + plot_height}"/>'
-                     f'<text class="muted" x="{x(index) + 3:.1f}" y="{height - 8}">{escape(year)}</text>')
-    for number, (strategy, points) in enumerate(series.items()):
-        color = COLORS[number % len(COLORS)]
-        dash = {"spy_mirror": ' stroke-dasharray="5 3"', "universe_ew": ' stroke-dasharray="2 3"',
-                "account": ' stroke-dasharray="8 4"'}.get(strategy, "")
-        line = " ".join(f"{x(index):.1f},{y(value):.1f}" for index, value in enumerate(points) if value is not None)
-        parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.7"{dash} points="{line}"/>')
-        last = next((value for value in reversed(points) if value is not None), None)
-        legend_y = top + 14 + number * 18
-        parts.append(f'<line x1="{left + plot_width + 14}" y1="{legend_y - 4}" x2="{left + plot_width + 34}" '
-                     f'y2="{legend_y - 4}" stroke="{color}" stroke-width="2.5"{dash}/>'
-                     f'<text x="{left + plot_width + 40}" y="{legend_y}">{escape(names.get(strategy, strategy))}'
-                     f'{escape(f" {last:+,.0f}") if last is not None else ""}</text>')
-    return "".join(parts) + "</svg>"
-
-
 def _call_text(call: dict) -> tuple[str, str, str]:
     """A call's result, fetch and email, in words."""
     result = "ok" if not call.get("error") else f"failed: {call['error']}"
@@ -650,8 +478,6 @@ def _lists_section(snapshot: dict) -> str:
              f'its value of the features its model\'s ranking follows most, with its percentile among the '
              f'{lists["universe_size"]:,} tradable stocks (p99: higher than 99% of them). Hover over a stock, or Tab '
              f'to it, for its SHAP and LIME values: how much each feature moves it up or down the ranking.</p>']
-    if lists.get("account"):  # How an account trades the buys; the API keeps none.
-        parts.append(f'<p class="note"><b>Account rule.</b> {escape(lists["account"])}</p>')
     if explanation.get("error"):
         parts.append(f'<p class="banner bad">The lists are not explained: {escape(explanation["error"])}.</p>')
     for name, sides in lists["models"].items():
@@ -670,14 +496,12 @@ def _lists_section(snapshot: dict) -> str:
                 hover = (f' data-model="{escape(name)}" data-ticker="{escape(item["ticker"])}" tabindex="0"'
                          if model and item["ticker"] in (model.get("local") or {}) else "")
                 rows.append(f'<tr{hover}><td>{item["rank"]}</td><td class="text"><b>{escape(item["ticker"])}</b></td>'
-                            f'<td>{_format(item["score"], "score")}</td>'
-                            f'<td>{_format(item["expected_return"], "signed")}</td>'
-                            f'<td>{_format(item["news_sentiment"], "sentiment")}</td><td>{item["news_count"]}</td>'
+                            f'<td>{item["news_count"]}</td>'
                             f'<td>{_format(item["close"], "ratio")}</td>'
                             f'<td>{_format(item["dollar_volume"], "money")}</td>{features}</tr>')
-            empty = f'<tr><td colspan="{8 + len(columns)}" class="muted">None</td></tr>'
+            empty = f'<tr><td colspan="{5 + len(columns)}" class="muted">None</td></tr>'
             parts.append(f'<div class="scroll"><b>{title}</b><table><tr><th>#</th><th class="text">Ticker</th>'
-                         f'<th>Score</th><th>Exp. return</th><th>Sentiment</th><th>News</th><th>Close</th>'
+                         f'<th>News</th><th>Close</th>'
                          f'<th>$ volume/day</th>{head}</tr>{"".join(rows) or empty}</table></div>')
     return "".join(parts) + "</section>"
 
@@ -693,9 +517,10 @@ def _drivers_section(snapshot: dict) -> str:
                  f'the value is missing for most stocks or the same for all. The news features that read LLM scores '
                  f'stay n/a until the day\'s articles are scored. Hover a feature for its meaning.</p>')
     for model in explanation["models"]:
+        # The score and its tie-break; the lists no longer show expected_return or news_sentiment.
         outputs = "".join(f'<tr><td class="text" title="{escape(OUTPUTS.get(row["feature"], ""))}">'
                           f'{escape(row["feature"])}</td><td>{_correlation(row["correlation"])}</td></tr>'
-                          for row in model["outputs"])
+                          for row in model["outputs"] if row["feature"] in RANKED_BY)
         if model["importances"]:
             ranked = sorted(model["importances"].items(), key=lambda pair: -abs(pair[1]))
             measured = ("<b>Importances the model measures</b><table>"
@@ -707,7 +532,7 @@ def _drivers_section(snapshot: dict) -> str:
         parts.append(f'<h3>{escape(model["name"])} <span class="meta">({model["scored"]:,} stocks scored)</span></h3>'
                      f'<p>{_summary_line(model)}</p>{_surrogate_note(model)}'
                      f'<div class="grid"><div>{driver_chart(model["drivers"])}</div>'
-                     f'<div><b>The ranking table\'s columns</b><table>{outputs}</table>{measured}</div></div>')
+                     f'<div><b>The score and its tie-break</b><table>{outputs}</table>{measured}</div></div>')
     return "".join(parts) + "</section>"
 
 
@@ -747,58 +572,6 @@ def _hover_data(snapshot: dict | None) -> str:
     return f'<script type="application/json" id="local-explanations">{data}</script>'
 
 
-def _backtest_section(backtest: dict | None) -> str:
-    parts = ['<section id="backtest-results"><h2>How the served models did in the backtest</h2>']
-    if backtest is None:
-        return "".join(parts) + ('<p class="note">No backtest run is served (RECOMMENDER_MODEL_RUN is empty), so '
-                                 'there are no backtest results to show.</p></section>')
-    years = backtest["chosen_on_years"]
-    span = f"{years[0]}-{years[-1]}" if years else "the test years"
-    names = {**STRATEGIES, **{model: f"{model} (served)" for model in backtest["models"]}}
-    parts.append(f'<p class="note">Out of sample, {escape(span)}: each year is traded by models fit on the years '
-                 f'before it, from $10,000 a year in $100 slices bought at the 16:00 close, from run '
-                 f'<code>{escape(backtest["run"])}</code>. {TEST_YEAR} is reserved for the one final evaluation, so '
-                 f'how the recommendations do in {TEST_YEAR} is not shown.</p>')
-    if backtest["strategies"]:
-        head = "".join(f'<th title="{escape(description)}">{escape(label)}</th>'
-                       for label, _, description in METRICS.values())
-        rows = "".join(f'<tr><td class="text">{escape(names.get(row["strategy"], row["strategy"]))}</td>'
-                       + "".join(f"<td>{_format(row[key], form)}</td>" for key, (_, form, _) in METRICS.items())
-                       + "</tr>" for row in backtest["strategies"])
-        parts.append(f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
-    if backtest["yearly"]:
-        head = "".join(f"<th>{escape(year)}</th>" for year in backtest["years"]) + "<th>Mean</th>"
-        rows = "".join(f'<tr><td class="text">{escape(names.get(strategy, strategy))}</td>'
-                       + "".join(f"<td>{_format(returns.get(year), 'signed')}</td>"
-                                 for year in backtest["years"] + ["mean"]) + "</tr>"
-                       for strategy, returns in backtest["yearly"].items())
-        parts.append(f'<b>Return each year</b> <span class="meta">(profit over the starting capital)</span>'
-                     f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
-    rules = backtest.get("rules")
-    if rules and rules["strategies"]:
-        head = "".join(f"<th>{escape(year)}</th>" for year in rules["years"]) + "<th>Mean</th>"
-        rows = []
-        for row in rules["strategies"]:
-            label = escape(row["label"])
-            label = f"<b>{label}</b>" if row["key"] == "make_room" else label  # The rule the API states.
-            cells = "".join(f"<td>{_format(row.get(year), 'signed')}</td>" for year in rules["years"] + ["mean"])
-            rows.append(f'<tr><td class="text">{label}</td>{cells}</tr>')
-        rows = "".join(rows)
-        parts.append('<b>The served models traded together, under the served account rule</b> <span class="meta">'
-                     '(one $10,000 account a year; each year from models fit on the years before it, but these '
-                     'models were chosen on these years, so this is in sample)</span>'
-                     f'<div class="scroll"><table><tr><th class="text">Strategy</th>{head}</tr>{rows}</table></div>')
-    elif len(backtest["models"]) > 1:
-        parts.append('<p class="note">The served models traded together under the served account rule are not '
-                     f'computed for this run: run <code>scripts/account_rules.py</code> (it writes '
-                     f'<code>{ACCOUNT_RULES}</code> beside the run).</p>')
-    if backtest["profit"]:
-        parts.append(f'<b>Cumulative profit</b><div class="scroll">{profit_chart(backtest["profit"], names)}</div>')
-    if backtest["missing"]:
-        parts.append(f'<p class="note">Not in the run: {escape(", ".join(backtest["missing"]))}.</p>')
-    return "".join(parts) + "</section>"
-
-
 def _history_section(history: list[dict]) -> str:
     parts = ['<section id="calls"><h2>Calls of the API</h2>',
              '<p class="note">Every GET or POST of /recommendations/latest, by hand or by the 16:00 email task, '
@@ -822,8 +595,8 @@ def _history_section(history: list[dict]) -> str:
 
 
 def render(snapshot: dict | None, history: list[dict], failed: dict | None = None) -> str:
-    """The page, in two tabs: the recommendations (the last lists, their explanation and the latest calls) and the
-    backtest simulation of the served run. failed is a call that just failed, shown above both tabs."""
+    """The page: the last lists, their explanation and the latest calls. failed is a call that just failed, shown
+    above them."""
     parts = ["<header><h1>ML510 recommendations</h1>"]
     if snapshot is not None:
         lists = snapshot["lists"]
@@ -842,20 +615,11 @@ def render(snapshot: dict | None, history: list[dict], failed: dict | None = Non
                      f'failed: {escape(failed["error"] or "")}'
                      + (' The lists below are from the last call that returned some.' if snapshot else "") + "</p>")
     if snapshot is None:
-        recommendations = ['<p class="banner">No call of /recommendations/latest has returned lists yet. This page '
-                           'is written again at every call: by hand, or by the 16:00 email task.</p>']
-        backtest = ['<p class="note">The served run\'s backtest shows here after the first call of the API.</p>']
+        parts.append('<p class="banner">No call of /recommendations/latest has returned lists yet. This page is '
+                     'written again at every call: by hand, or by the 16:00 email task.</p>')
     else:
-        recommendations = [_lists_section(snapshot), _drivers_section(snapshot)]
-        backtest = [_backtest_section(snapshot["backtest"])]
-    recommendations.append(_history_section(history))
-    parts.append('<nav class="tabs" role="tablist">' + "".join(
-        f'<button type="button" role="tab" id="tab-{name}" data-tab="{name}" aria-controls="panel-{name}" '
-        f'aria-selected="{"true" if index == 0 else "false"}">{escape(label)}</button>'
-        for index, (name, label) in enumerate(TABS)) + "</nav>")
-    for (name, _), content in zip(TABS, (recommendations, backtest)):
-        parts.append(f'<div class="panel" role="tabpanel" id="panel-{name}" aria-labelledby="tab-{name}">'
-                     + "".join(content) + "</div>")
+        parts += [_lists_section(snapshot), _drivers_section(snapshot)]
+    parts.append(_history_section(history))
     parts.append('<p class="note">This page refreshes every minute. Every call of the API writes it again, as '
                  'index.html in the dashboard folder (RECOMMENDER_DASHBOARD_DIR, by default data/processed/dashboard); '
                  'the API serves it at /dashboard.</p>')

@@ -42,6 +42,9 @@ class AccountRule(BaseModel):
     # The served model whose oldest open trades an order the cash does not cover sells first, never one bought the same
     # day; None: such an order is skipped.
     make_room: str | None = None
+    # Where the cash not in trades is held from each close to the next (account.trade sweep); an order spends it
+    # first. None: it stays cash.
+    idle_cash: str | None = None
     summary: str  # The rule in words.
 
 

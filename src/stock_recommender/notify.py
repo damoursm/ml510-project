@@ -9,12 +9,11 @@ from .config import Settings
 from .schemas import EmailReport, Recommendation, RecommendationList
 
 log = logging.getLogger("uvicorn.error")  # Uvicorn's general logger, which its console handler prints.
-HEADERS = ["#", "Ticker", "Score", "Exp. return", "Sentiment", "News", "Close"]
+HEADERS = ["#", "Ticker", "News", "Close"]
 
 
 def cells(item: Recommendation) -> list[str]:
-    return [str(item.rank), item.ticker, f"{item.score:.4f}", f"{item.expected_return:+.2%}",
-            f"{item.news_sentiment:+.2f}", str(item.news_count), f"{item.close:,.2f}"]
+    return [str(item.rank), item.ticker, str(item.news_count), f"{item.close:,.2f}"]
 
 
 def exit_text(body: RecommendationList) -> str:
@@ -36,10 +35,6 @@ def compose(body: RecommendationList, sender: str, recipients: list[str]) -> Ema
              f"before {body.news_cutoff:%Y-%m-%d %H:%M} UTC. Model {body.model_version}{source}. "
              f"Exit: {exit_text(body)}.")
     text, html = [intro], [f"<p>{escape(intro)}</p>"]
-    if body.account:  # How an account trades the buys, as the served run's backtest did.
-        rule = f"Account rule: {body.account.summary}"
-        text.append(rule)
-        html.append(f"<p>{escape(rule)}</p>")
     if body.fetch and body.fetch.errors:  # The lists come from the older data still on disk.
         warning = "Warning: fetching new data failed, so these lists may be stale: " + "; ".join(body.fetch.errors)
         text.append(warning)

@@ -74,11 +74,13 @@ changes by itself.
 - **When to sell.** `exits` gives each model's exit strategy, and the email states it: hold at most `hold_days`
   trading days, and sell earlier at a close where a rule fires (see *Exit strategy* below).
   `horizon_days` is the longest hold among the models.
-- **How to trade them.** `account` gives the account rule, and the email and the dashboard state it. The API keeps no
-  account: the lists are the same whatever the rule, and the rule says how an account trades the buys.
+- **How to trade them.** `account` gives the account rule. The API keeps no account: the lists are the same whatever
+  the rule, and the rule says how an account trades the buys.
   - The rule is the run's backtest account: from its capital ($10,000), each stock to buy is bought for its order value
     ($100) at today's close. Each model's #1 goes first, then each one's #2, and so on. Each stock is sold by its
-    model's exit, with the run's costs (5 bps a side), and idle cash stays cash.
+    model's exit, with the run's costs (5 bps a side).
+  - **No cash sits idle:** the cash not in trades is held in SPY from each close to the next (`account.trade`'s sweep,
+    `IDLE_CASH` in `served_models.py`), and an order spends it first. Moving it in or out pays the same 5 bps.
   - **One change:** when an order finds no cash, it first sells the oldest trades of the served model that earned the
     least per invested dollar per day. It never sells a trade bought the same day, and it does this for every order,
     that model's own included.
@@ -90,8 +92,9 @@ changes by itself.
     `make_room`), beside the backtest's own rule. The rule's account and each model alone are traded again with
     their idle cash held in SPY: an order spends that cash first, and only then sells trades. Each year, the rule's
     account's profit is also split into what each model's trades and its idle cash made after their costs
-    (`account.contributions`, `parts_by_year`). It saves the result as `account_rules.json` in the run folder, for
-    the dashboard. It refits each year's models, so it takes about half an hour.
+    (`account.contributions`, `parts_by_year`). It saves the result as `account_rules.json` in the run folder, and
+    the final test compares its replay of the served rule in 2025 with it. It refits each year's models, so it takes
+    about half an hour.
 - **Health.** `/health` shows whether each model loaded. If none loads, the API answers 503 and the error goes to
   `logs/api.log`.
 
@@ -138,13 +141,10 @@ Both tasks run only while you are logged on. `-Python` picks another interpreter
 
 `stock_recommender/dashboard.py` writes a page that explains the recommendations, again at every call of the API: every
 GET or POST of `/recommendations/latest`, by hand or by the 16:00 email task. Open
-http://127.0.0.1:8000/dashboard (it refreshes every minute), or `data/processed/dashboard/index.html` directly. It has
-two tabs; `/dashboard#backtest` opens the second, and the minute's refresh keeps the tab you chose.
-
-The **Recommendations** tab:
-- **The lists.** Each served model's buy and sell lists, under the account rule (*How to trade them* above). Beside
-  each stock: its value of the features its model's ranking follows most, with its percentile among the tradable
-  stocks.
+http://127.0.0.1:8000/dashboard (it refreshes every minute), or `data/processed/dashboard/index.html` directly. It
+shows:
+- **The lists.** Each served model's buy and sell lists. Beside each stock: its value of the features its model's
+  ranking follows most, with its percentile among the tradable stocks.
 - **SHAP and LIME values.** Hover over a stock, or Tab to it, to see how much each feature moves it up or down the
   ranking, in points of rank percentile (100 is the best stock, and the average stock sits at 50).
   - The models rank from raw bars and news, not from a row of features, so both methods explain a surrogate: a
@@ -165,14 +165,6 @@ The **Recommendations** tab:
   measures.
   The news features that read LLM scores stay n/a until the day's articles are scored.
 - **Calls.** The latest calls, with their result, fetch and email: a count, never the addresses.
-
-The **Backtest simulation** tab shows the served run's out-of-sample results, 2022-2025, from its tables. Each model,
-the account and the SPY references get their mean yearly return, Sharpe, drawdown, profitable periods, IC and spread,
-then their return each year and the cumulative profit. With several served models, a table then shows them traded
-together each year under the account rule, beside the backtest's own rule, each model alone and SPY held, with the
-rule's account and each model also shown with their idle cash in SPY (`account_rules.json`). It is in sample: those
-models were chosen on these years. How the recommendations do in 2026
-is never shown: 2026 is reserved for the one final evaluation.
 
 Explaining a new day's lists takes a few seconds and runs after the response, so it never delays a call. A failure is
 logged and shown on the page; it never fails the call, and a failed call keeps the last lists on the page.
@@ -512,6 +504,20 @@ python scripts/backtest.py                     # about 2 minutes per model; --he
     - It came out of a news-model research of 2021-2025 data (every 5th session, nested walk-forward): on
       20-session returns its daily IC was about 0.02, positive in each test year, against 0.005 for a random forest
       on the 8 news features over 5 sessions.
+  - `liquidity_boost` was backtested too and removed. It was LightGBM on the one number `most_liquid` ranks by: a
+    stock's median dollars traded over the 60-session bars window.
+    - Alone it made +5.5% a year out of sample (2022-2025), against +15.5% for `most_liquid`.
+    - Trained through 2025, it rated the most liquid stocks best, so in 2026 it bought `most_liquid`'s 5 stocks
+      every day, with a worse exit.
+    - Served as a third model for about half an hour on 2026-11-25, the account made +21.7% a year in 2022-2025
+      against the pair's +20.5%, but -4.9% in 2026 against +6.7%, both with the idle cash in SPY
+      (`artifacts/final/20261126T005257Z-three_models`).
+    - Its code is removed. A copy is in its run folder (`artifacts/cv/20261125T224830Z-e0645d38/source/`), and
+      its runs stay in `artifacts/`.
+  - `price_boost`, LightGBM on the ten daily-bar features, was backtested too and rejected: +6.1% a year out of
+    sample (2022-2025), against +9.6% for SPY bought on the same dates, and adding it to the served account hurt it
+    at every list size tried. Two variants with ten more volatility and liquidity features lost as well. Its code
+    is removed; its runs stay in `artifacts/`.
   - Three random forests were backtested too, and rejected: on the ten daily-bar features (-13.1% a year out of
     sample, 2022-2025), on the eight news features (-5.5%), and on both together (-1.7%). Their code is removed;
     their runs stay in `artifacts/cv/`.

@@ -80,13 +80,15 @@ class DashboardTest(unittest.TestCase):
         client = self.client()
         empty = client.get("/dashboard").text
         self.assertIn("No call of /recommendations/latest has returned lists yet", empty)
-        self.assertIn(">Backtest simulation</button>", empty)
         body = client.get("/recommendations/latest", params={"limit": 3}).json()
         buys = [item["ticker"] for item in body["buy"]]
         page = client.get("/dashboard").text
         self.assertEqual(page, (self.board / "index.html").read_text(encoding="utf-8"))  # Readable without the API.
         for ticker in buys:
             self.assertIn(f"<b>{ticker}</b>", page)
+        self.assertIn("<th>News</th><th>Close</th>", page)
+        for column in ("<th>Score</th>", "<th>Exp. return</th>", "<th>Sentiment</th>"):
+            self.assertNotIn(column, page)  # The lists show no score, expected return or sentiment.
         self.assertIn("What drives each model", page)
         client.post("/recommendations/latest", params={"limit": 2})
         self.assertEqual([(call["method"], call["error"]) for call in self.calls()], [("GET", None), ("POST", None)])
@@ -214,71 +216,31 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("The lists are not explained: RuntimeError: boom", page)
         self.assertIn(f"<b>{response.json()['buy'][0]['ticker']}</b>", page)
 
-    def test_the_served_runs_backtest_is_shown_without_2026(self):
-        folder = make_run(self.root, {"liquid": load_models()})
-        tables = folder / "tables"
-        tables.mkdir()
-        pd.DataFrame([{"strategy": "liquid", "scope": "all", "mean_yearly_return": 0.15, "sharpe": 0.58},
-                      {"strategy": "liquid", "scope": "2022", "mean_yearly_return": -0.4},
-                      {"strategy": "spy_hold", "scope": "all", "mean_yearly_return": 0.125}]).to_csv(
-            tables / "metrics.csv", index=False)
-        pd.DataFrame([{"strategy": "liquid", "2022": -0.4, "2025": 0.35, "2026": 0.9, "mean": 0.15}]).to_csv(
-            tables / "yearly.csv", index=False)
-        pd.DataFrame({"date": ["2022-01-03", "2025-12-24", "2026-01-05"], "liquid": [-10.0, 12_361.0, 99_999.0],
-                      "spy_hold": [-10.0, 10_031.0, 88_888.0]}).to_csv(tables / "profit.csv", index=False)
-        self.client(model_run=str(folder)).get("/recommendations/latest")
-        backtest = self.snapshot()["backtest"]
-        self.assertEqual([row["strategy"] for row in backtest["strategies"]], ["liquid", "spy_hold"])
-        self.assertEqual((backtest["years"], backtest["profit"]["dates"]), (["2022", "2025"],
-                                                                           ["2022-01-03", "2025-12-24"]))
-        page = (self.board / "index.html").read_text(encoding="utf-8")
-        self.assertIn("liquid (served)", page)
-        self.assertIn("+15.0%", page)
-        self.assertIn("<polyline", page)
-        self.assertIn("2026 is reserved for the one final evaluation", page)
-        for later in ("<th>2026</th>", "+90.0%", "99,999", "88,888"):
-            self.assertNotIn(later, page)
-
-    def test_the_account_rule_and_the_served_models_traded_under_it_are_shown(self):
+    def test_the_page_shows_no_backtest(self):
+        # A served run with backtest tables and its account rule's returns beside it: the page shows none of them.
         models = {"liquid": load_models(), "news": replace(load_models(), version="news")}
         folder = make_run(self.root, models, capital=10_000.0, order_value=100.0)
         write_picks(folder, {"liquid": 0.0010, "news": 0.0007})
-        self.client(model_run=str(folder)).get("/recommendations/latest")
-        self.assertIn("first sell news", self.snapshot()["lists"]["account"])
-        page = (self.board / "index.html").read_text(encoding="utf-8")
-        self.assertIn("<b>Account rule.</b> From $10,000, buy $100 of each stock to buy at today", page)
-        self.assertIn("run <code>scripts/account_rules.py</code>", page)  # Not computed for this run yet.
-        returns = {"make_room": ("Account, the served rule", {"2022": -0.334, "2025": 0.176, "2026": 0.9}),
-                   "skip": ("Account, the backtest's rule", {"2022": -0.288, "2025": 0.399, "2026": -0.5})}
+        pd.DataFrame([{"strategy": "liquid", "scope": "all", "mean_yearly_return": 0.15}]).to_csv(
+            folder / "tables" / "metrics.csv", index=False)
         (folder / "account_rules.json").write_text(json.dumps({
-            "years": [2022, 2025, 2026], "make_room": "news",
-            "strategies": {key: {"label": label, "return_by_year": by_year} for key, (label, by_year)
-                           in returns.items()}}), encoding="utf-8")
-        self.client(model_run=str(folder)).get("/recommendations/latest")
-        backtest = self.snapshot()["backtest"]["rules"]
-        self.assertEqual((backtest["years"], backtest["make_room"]), (["2022", "2025"], "news"))
-        page = (self.board / "index.html").read_text(encoding="utf-8")
-        self.assertIn("<b>Account, the served rule</b>", page)  # The rule the API states, in bold.
-        for shown in ("-33.4%", "+17.6%", "-7.9%"):  # Its mean over 2022-2025, not 2026's.
-            self.assertIn(shown, page)
-        for later in ("+90.0%", "-50.0%"):
-            self.assertNotIn(later, page)
-        self.assertNotIn("scripts/account_rules.py", page)
-
-    def test_the_page_has_a_recommendations_tab_and_a_backtest_simulation_tab(self):
-        folder = make_run(self.root, {"liquid": load_models()})
-        self.client(model_run=str(folder)).get("/recommendations/latest")
-        page = (self.board / "index.html").read_text(encoding="utf-8")
-        self.assertLess(page.index(">Recommendations</button>"), page.index(">Backtest simulation</button>"))
-        recommendations, backtest = page.index('id="panel-recommendations"'), page.index('id="panel-backtest"')
-        for section in ('id="lists"', 'id="drivers"', 'id="calls"'):
-            self.assertTrue(recommendations < page.index(section) < backtest, section)
-        self.assertGreater(page.index('id="backtest-results"'), backtest)
-        # A tab's address is its name, so no element may carry it as id: choosing a tab would scroll to it.
-        for name in ("recommendations", "backtest"):
-            self.assertIn(f'data-tab="{name}"', page)
-            self.assertNotIn(f'id="{name}"', page)
-        self.assertIn("location.reload()", page)  # The minute's reload keeps the tab in the address.
+            "years": [2022], "make_room": "news",
+            "strategies": {"make_room": {"label": "Account, the served rule", "return_by_year": {"2022": -0.334}}}}),
+            encoding="utf-8")
+        client = self.client(model_run=str(folder))
+        pages = [client.get("/dashboard").text]  # Before any call, too.
+        body = client.get("/recommendations/latest").json()
+        self.assertIn("first sell news", body["account"]["summary"])  # The API still states the account rule.
+        self.assertNotIn("backtest", self.snapshot())
+        self.assertNotIn("account", self.snapshot()["lists"])
+        pages.append((self.board / "index.html").read_text(encoding="utf-8"))
+        for page in pages:
+            for gone in ("Backtest simulation", "backtest-results", 'role="tab', "data-tab", "Account rule",
+                         "Account, the served rule", "(served)", "<polyline"):
+                self.assertNotIn(gone, page)
+        sections = [pages[-1].index(f'<section id="{name}">') for name in ("lists", "drivers", "calls")]
+        self.assertEqual(sections, sorted(sections))  # One page: the lists, what drives them, the calls.
+        self.assertIn("location.reload()", pages[-1])  # It still refreshes every minute.
 
     def test_without_a_dashboard_folder_nothing_is_written(self):
         client = self.client(dashboard_dir=None)

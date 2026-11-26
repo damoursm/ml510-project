@@ -25,6 +25,7 @@ TEST_YEAR = 2026  # The reserved final test: a served selection was chosen and f
 # /health lists those changed since the run.
 DECISION_PATH = ("recommend.py", "models.py", "data.py", "exits.py")
 SIZES = ("horizon_days", "bars_lookback", "news_lookback_days", "picks")
+IDLE_CASH = "SPY"  # The served rule holds the cash not in trades in SPY, so none of it sits idle (account.trade sweep).
 MODEL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
 
@@ -92,7 +93,8 @@ class Selection:
         """How an account trades the buy lists, the guide the API states beside them (it keeps no account): the run's
         backtest account, buying each listed stock for order_value at the close of its day, each model's best first
         and the models in turn, and selling each by its model's exit, except that an order the cash does not cover
-        first sells make_room's oldest trades (account.trade make_room). None when the run records no account."""
+        first sells make_room's oldest trades (account.trade make_room), and that the cash not in trades is held in
+        IDLE_CASH from each close to the next (account.trade sweep). None when the run records no account."""
         if not (self.capital and self.order_value and self.cost_bps is not None):
             return None
         if self.make_room:
@@ -102,9 +104,10 @@ class Selection:
             room = "When an order finds no cash, skip it."
         summary = (f"From ${self.capital:,.0f}, buy ${self.order_value:,.0f} of each stock to buy at today's close, "
                    f"each model's #1 first, then each one's #2, and so on, and sell each when its model's exit says. "
-                   f"{room} Costs: {self.cost_bps:g} bps a side. Idle cash stays cash.")
+                   f"Hold the idle cash in {IDLE_CASH} from each close to the next: an order spends it first. {room} "
+                   f"Costs: {self.cost_bps:g} bps a side, on {IDLE_CASH} bought and sold too.")
         return AccountRule(capital=self.capital, order_value=self.order_value, cost_bps=self.cost_bps,
-                           make_room=self.make_room, summary=summary)
+                           make_room=self.make_room, idle_cash=IDLE_CASH, summary=summary)
 
 
 def _make_room(folder: Path, names: tuple[str, ...]) -> tuple[str | None, tuple]:

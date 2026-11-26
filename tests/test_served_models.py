@@ -121,10 +121,13 @@ class SelectionTest(Store):
         self.assertEqual((selection.make_room, selection.return_per_day),
                          ("news", (("liquid", 0.0010), ("news", 0.0007))))
         rule = selection.account_rule()
-        self.assertEqual((rule.capital, rule.order_value, rule.cost_bps, rule.make_room),
-                         (10_000.0, 100.0, 5.0, "news"))
+        self.assertEqual((rule.capital, rule.order_value, rule.cost_bps, rule.make_room, rule.idle_cash),
+                         (10_000.0, 100.0, 5.0, "news", "SPY"))
         self.assertIn("From $10,000, buy $100 of each stock to buy at today's close", rule.summary)
         self.assertIn("first sell news's oldest trades, never one bought the same day", rule.summary)
+        # No cash sits idle: it is held in SPY, and an order spends it before selling a trade.
+        self.assertIn("Hold the idle cash in SPY from each close to the next: an order spends it first.", rule.summary)
+        self.assertNotIn("Idle cash stays cash", rule.summary)
         # Without the run's measure, or with one model, there is no model to make room with: such an order is skipped.
         (folder / "tables" / "picks.csv").unlink()
         self.assertIsNone(load_selection(str(folder)).make_room)
